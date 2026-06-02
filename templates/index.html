@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>liveobject &mdash; Hailo-10H detection</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="{{ url_for('static', filename='vendor/chart.umd.min.js') }}"></script>
+</head>
+<body>
+  <header>
+    <h1>liveobject</h1>
+    <span class="sub">YOLO on Raspberry Pi AI HAT+ 2 &middot; Hailo-10H</span>
+    <span id="status-dot" class="dot" title="live"></span>
+  </header>
+
+  <main>
+    <section class="video-card">
+      <div class="video-wrap">
+        <img id="stream" src="{{ url_for('stream') }}" alt="live detection feed">
+        <div id="paused-overlay" class="overlay hidden">PAUSED</div>
+      </div>
+      <div class="video-bar">
+        <span class="pill"><b id="m-fps">0</b> fps</span>
+        <span class="pill"><b id="m-infer">0</b> ms infer</span>
+        <span class="pill"><b id="m-count">0</b> objects</span>
+        <span class="pill" id="m-model">&mdash;</span>
+      </div>
+    </section>
+
+    <aside class="panel">
+      <div class="card">
+        <h2>Controls</h2>
+
+        <label class="ctl">
+          <span>Model</span>
+          <select id="model"></select>
+        </label>
+
+        <label class="ctl">
+          <span>Max detections: <b id="maxd-val">10</b></span>
+          <input id="maxd" type="range" min="1" max="50" value="10">
+        </label>
+
+        <label class="ctl">
+          <span>Confidence threshold: <b id="thr-val">0.40</b></span>
+          <input id="thr" type="range" min="5" max="95" value="40">
+        </label>
+
+        <div class="btn-row">
+          <button id="pause" class="btn">Pause</button>
+          <button id="snap" class="btn">Snapshot</button>
+          <a id="snap-link" class="btn ghost hidden" href="/snapshot/latest" target="_blank">View</a>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>System</h2>
+        <div class="stat-grid">
+          <div><span class="k">RAM</span><span class="v"><b id="s-ram">0</b> %</span></div>
+          <div><span class="k">RAM used</span><span class="v"><b id="s-rammb">0</b> MB</span></div>
+          <div><span class="k">CPU</span><span class="v"><b id="s-cpu">0</b> %</span></div>
+          <div><span class="k">CPU temp</span><span class="v"><b id="s-temp">&mdash;</b> &deg;C</span></div>
+        </div>
+        <div class="chart-box"><canvas id="ramChart"></canvas></div>
+        <div class="chart-box"><canvas id="fpsChart"></canvas></div>
+      </div>
+
+      <div class="card">
+        <h2>Detections <span id="det-count" class="tag">0</span></h2>
+        <ul id="det-list" class="det-list"><li class="muted">waiting&hellip;</li></ul>
+      </div>
+    </aside>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

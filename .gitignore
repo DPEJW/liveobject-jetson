@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Runtime artifacts
+snapshots/
+*.log
+hailort*.log
