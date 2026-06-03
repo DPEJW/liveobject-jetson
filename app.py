@@ -71,6 +71,7 @@ def set_config():
         max_detections=data.get("max_detections"),
         threshold=data.get("threshold"),
         paused=data.get("paused"),
+        rotation=data.get("rotation"),
     )
     return jsonify(cfg)
 

@@ -65,6 +65,11 @@ $("thr").addEventListener("change", (e) => postConfig({ threshold: e.target.valu
 
 $("model").addEventListener("change", (e) => postConfig({ model: e.target.value }));
 
+$("rotate").addEventListener("click", () => {
+  const cur = +($("rotate").dataset.rot || 0);
+  postConfig({ rotation: (cur + 90) % 360 });
+});
+
 let paused = false;
 $("pause").addEventListener("click", () => {
   paused = !paused;
@@ -85,6 +90,30 @@ $("snap").addEventListener("click", () => {
     })
     .catch(() => { $("snap").textContent = "Snapshot"; });
 });
+
+// ---- fullscreen ----
+const videoWrap = $("video-wrap");
+const fsExit = $("fs-exit");
+
+function enterFullscreen() {
+  const el = videoWrap;
+  const fn = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
+  if (fn) fn.call(el);
+}
+function exitFullscreen() {
+  const fn = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen;
+  if (fn) fn.call(document);
+}
+function onFsChange() {
+  const fs = document.fullscreenElement || document.webkitFullscreenElement;
+  fsExit.classList.toggle("hidden", !fs);
+}
+$("fs-btn").addEventListener("click", enterFullscreen);
+fsExit.addEventListener("click", exitFullscreen);
+document.addEventListener("fullscreenchange", onFsChange);
+document.addEventListener("webkitfullscreenchange", onFsChange);
+// (Pressing Esc also exits fullscreen — the browser fires fullscreenchange,
+//  which hides the Exit button and returns you to the dashboard.)
 
 // ---- detections list ----
 function renderDetections(dets) {
@@ -119,6 +148,9 @@ function poll() {
     $("m-infer").textContent = s.infer_ms.toFixed(1);
     $("m-count").textContent = s.count;
     $("m-model").textContent = s.config.model;
+
+    $("rotate").dataset.rot = s.config.rotation;
+    $("rot-val").textContent = s.config.rotation + "°";
 
     $("s-ram").textContent = s.ram_pct.toFixed(0);
     $("s-rammb").textContent = s.ram_used_mb + " / " + s.ram_total_mb;

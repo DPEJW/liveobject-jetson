@@ -12,15 +12,16 @@ MODELS = {
 }
 DEFAULT_MODEL = "yolov8m"
 
-# Display (main) stream size BEFORE rotation, in landscape orientation.
-# With rotate=True the frame is turned 90 deg clockwise to correct this Pi's
-# sideways camera mount, so the served image is portrait.
+# Display (main) stream size in landscape orientation. Rotation is applied per
+# frame at runtime (see DEFAULTS["rotation"] and the UI rotate control).
 DISPLAY_SIZE = (1280, 720)
 
 DEFAULTS = {
     "max_detections": 10,
     "threshold": 0.40,
-    "rotate": True,
+    # Frame rotation in degrees clockwise (0/90/180/270). 0 and 180 are
+    # landscape; 90 and 270 are portrait. Adjustable live from the UI.
+    "rotation": 0,
 }
 
 HOST = "0.0.0.0"

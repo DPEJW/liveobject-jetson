@@ -16,9 +16,11 @@
 
   <main>
     <section class="video-card">
-      <div class="video-wrap">
+      <div class="video-wrap" id="video-wrap">
         <img id="stream" src="{{ url_for('stream') }}" alt="live detection feed">
         <div id="paused-overlay" class="overlay hidden">PAUSED</div>
+        <button id="fs-btn" class="fs-btn" title="Fullscreen" aria-label="Fullscreen">⛶</button>
+        <button id="fs-exit" class="fs-exit hidden" title="Exit fullscreen (Esc)">✕&nbsp;Exit</button>
       </div>
       <div class="video-bar">
         <span class="pill"><b id="m-fps">0</b> fps</span>
@@ -45,6 +47,11 @@
         <label class="ctl">
           <span>Confidence threshold: <b id="thr-val">0.40</b></span>
           <input id="thr" type="range" min="5" max="95" value="40">
+        </label>
+
+        <label class="ctl">
+          <span>Orientation: <b id="rot-val">0&deg;</b></span>
+          <button id="rotate" class="btn ghost" data-rot="0">Rotate 90&deg; &#10227;</button>
         </label>
 
         <div class="btn-row">

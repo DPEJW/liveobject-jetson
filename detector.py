@@ -16,7 +16,8 @@ import numpy as np
 from picamera2 import Picamera2
 from picamera2.devices import Hailo
 
-from config import DEFAULTS, DEFAULT_MODEL, DISPLAY_SIZE, MODELS, SNAPSHOT_DIR
+from config import (DEFAULTS, DEFAULT_MODEL, DISPLAY_SIZE, MODELS,
+                    SNAPSHOT_DIR)
 from labels import COCO_LABELS
 
 
@@ -37,7 +38,7 @@ class DetectionWorker:
         self.model_key = DEFAULT_MODEL
         self.max_detections = DEFAULTS["max_detections"]
         self.threshold = DEFAULTS["threshold"]
-        self.rotate = DEFAULTS["rotate"]
+        self.rotation = DEFAULTS["rotation"]   # degrees clockwise
         self.paused = False
 
         # Requests handled on the worker thread.
@@ -68,7 +69,8 @@ class DetectionWorker:
             self._thread.join(timeout=3)
 
     # ---- config API (called from the Flask thread) ----
-    def set_config(self, max_detections=None, threshold=None, paused=None):
+    def set_config(self, max_detections=None, threshold=None, paused=None,
+                   rotation=None):
         with self._lock:
             if max_detections is not None:
                 self.max_detections = max(1, min(100, int(max_detections)))
@@ -76,6 +78,8 @@ class DetectionWorker:
                 self.threshold = max(0.05, min(0.95, float(threshold)))
             if paused is not None:
                 self.paused = bool(paused)
+            if rotation is not None:
+                self.rotation = (int(rotation) % 360) // 90 * 90  # snap 0/90/180/270
         return self.config()
 
     def request_model(self, model_key):
@@ -97,7 +101,7 @@ class DetectionWorker:
             "max_detections": self.max_detections,
             "threshold": round(self.threshold, 2),
             "paused": self.paused,
-            "rotate": self.rotate,
+            "rotation": self.rotation,
         }
 
     def fps(self):
@@ -165,9 +169,10 @@ class DetectionWorker:
                 lores = req.make_array("lores")
                 req.release()
 
-                if self.rotate:
-                    main = np.rot90(main, k=-1)   # 90 deg clockwise
-                    lores = np.rot90(lores, k=-1)
+                k = (-(self.rotation // 90)) % 4   # degrees CW -> np.rot90 steps
+                if k:
+                    main = np.rot90(main, k)
+                    lores = np.rot90(lores, k)
 
                 # Model expects RGB; picamera2 gives BGR -> reverse channels.
                 model_in = np.ascontiguousarray(lores[:, :, ::-1])
