@@ -108,6 +108,7 @@ input[type=range] { accent-color: var(--accent); height: 22px; }
 .btn:hover { filter: brightness(1.08); }
 .btn.ghost { background: transparent; color: var(--accent2); border: 1px solid var(--line); }
 .btn.paused { background: #e5a23b; }
+.btn.on { background: var(--accent2); color: #03121f; border-color: var(--accent2); }
 
 .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; margin-bottom: 12px; }
 .stat-grid .k { color: var(--muted); font-size: 12px; display: block; }

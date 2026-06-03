@@ -70,6 +70,10 @@ $("rotate").addEventListener("click", () => {
   postConfig({ rotation: (cur + 90) % 360 });
 });
 
+let flipH = false, flipV = false;
+$("flip-h").addEventListener("click", () => postConfig({ flip_h: !flipH }));
+$("flip-v").addEventListener("click", () => postConfig({ flip_v: !flipV }));
+
 let paused = false;
 $("pause").addEventListener("click", () => {
   paused = !paused;
@@ -151,6 +155,10 @@ function poll() {
 
     $("rotate").dataset.rot = s.config.rotation;
     $("rot-val").textContent = s.config.rotation + "°";
+
+    flipH = s.config.flip_h; flipV = s.config.flip_v;
+    $("flip-h").classList.toggle("on", flipH);
+    $("flip-v").classList.toggle("on", flipV);
 
     $("s-ram").textContent = s.ram_pct.toFixed(0);
     $("s-rammb").textContent = s.ram_used_mb + " / " + s.ram_total_mb;

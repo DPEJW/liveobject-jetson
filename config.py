@@ -22,6 +22,9 @@ DEFAULTS = {
     # Frame rotation in degrees clockwise (0/90/180/270). 0 and 180 are
     # landscape; 90 and 270 are portrait. Adjustable live from the UI.
     "rotation": 0,
+    # Mirror/flip the frame (applied after rotation). Adjustable live from the UI.
+    "flip_h": False,   # horizontal mirror (left-right)
+    "flip_v": False,   # vertical flip (up-down)
 }
 
 HOST = "0.0.0.0"

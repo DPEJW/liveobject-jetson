@@ -39,6 +39,8 @@ class DetectionWorker:
         self.max_detections = DEFAULTS["max_detections"]
         self.threshold = DEFAULTS["threshold"]
         self.rotation = DEFAULTS["rotation"]   # degrees clockwise
+        self.flip_h = DEFAULTS["flip_h"]
+        self.flip_v = DEFAULTS["flip_v"]
         self.paused = False
 
         # Requests handled on the worker thread.
@@ -70,7 +72,7 @@ class DetectionWorker:
 
     # ---- config API (called from the Flask thread) ----
     def set_config(self, max_detections=None, threshold=None, paused=None,
-                   rotation=None):
+                   rotation=None, flip_h=None, flip_v=None):
         with self._lock:
             if max_detections is not None:
                 self.max_detections = max(1, min(100, int(max_detections)))
@@ -80,6 +82,10 @@ class DetectionWorker:
                 self.paused = bool(paused)
             if rotation is not None:
                 self.rotation = (int(rotation) % 360) // 90 * 90  # snap 0/90/180/270
+            if flip_h is not None:
+                self.flip_h = bool(flip_h)
+            if flip_v is not None:
+                self.flip_v = bool(flip_v)
         return self.config()
 
     def request_model(self, model_key):
@@ -102,6 +108,8 @@ class DetectionWorker:
             "threshold": round(self.threshold, 2),
             "paused": self.paused,
             "rotation": self.rotation,
+            "flip_h": self.flip_h,
+            "flip_v": self.flip_v,
         }
 
     def fps(self):
@@ -173,6 +181,12 @@ class DetectionWorker:
                 if k:
                     main = np.rot90(main, k)
                     lores = np.rot90(lores, k)
+                if self.flip_h:
+                    main = np.fliplr(main)
+                    lores = np.fliplr(lores)
+                if self.flip_v:
+                    main = np.flipud(main)
+                    lores = np.flipud(lores)
 
                 # Model expects RGB; picamera2 gives BGR -> reverse channels.
                 model_in = np.ascontiguousarray(lores[:, :, ::-1])

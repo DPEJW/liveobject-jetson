@@ -72,6 +72,8 @@ def set_config():
         threshold=data.get("threshold"),
         paused=data.get("paused"),
         rotation=data.get("rotation"),
+        flip_h=data.get("flip_h"),
+        flip_v=data.get("flip_v"),
     )
     return jsonify(cfg)
 
