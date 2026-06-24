@@ -1,51 +1,83 @@
-# liveobject
+# liveobject (Jetson Orin NX edition)
 
-Live object detection web app for the **Raspberry Pi 5 + AI HAT+ 2 (Hailo‑10H)**.
+Live object-detection web app for the **NVIDIA Jetson Orin NX** with a **Basler
+GigE Vision** camera and **TensorRT** (YOLO26 / YOLO11) inference on the GPU.
 
-It runs a YOLO model on the Hailo NPU via Picamera2 and serves a browser
-dashboard that shows the live camera feed with bounding boxes and class names,
-lets you tune detection from the UI, and plots RAM and FPS in real time.
+It serves a browser dashboard with the live camera feed, bounding boxes + class
+names + confidence, live detection controls, and real-time FPS / inference
+timing.
+
+> Ported from the Raspberry Pi 5 + AI HAT+ (Hailo-10H) version (the original
+> `liveobject` repo). The public `DetectionWorker` interface is unchanged — only
+> the camera and inference backends were swapped.
+
+---
+
+## What changed from the Pi version
+
+|              | Raspberry Pi 5            | Jetson Orin NX (this repo)              |
+|--------------|---------------------------|-----------------------------------------|
+| Camera       | Picamera2 (CSI)           | Basler GigE Vision via **pypylon**      |
+| Inference    | Hailo-10H NPU (HEF)       | **TensorRT** FP16 engine, GPU (pycuda)  |
+| Models       | yolov8m / yolov11m (HEF)  | **yolo26m / yolo26l / yolo11m** (.engine) |
+| NMS          | baked into the HEF        | `cv2.dnn.NMSBoxes` on the decoded head  |
 
 ---
 
 ## Features
 
-- **Live annotated video** — MJPEG stream with bounding boxes + class name + confidence (~22 fps, ~30 ms inference).
-- **Detections panel** — live list of detected objects and their confidence.
-- **Backend controls** (all live, no restart):
-  - **Max detections** — cap how many objects are reported (keeps the highest‑scoring).
-  - **Confidence threshold** — filter out weak detections.
-  - **Model switch** — `yolov8m` ⇄ `yolov11m` (both Hailo‑10H, 80 COCO classes).
-  - **Snapshot** — save the current annotated frame to `snapshots/`.
-  - **Pause / Resume** — freeze the pipeline to save CPU.
-- **Realtime graphs** — RAM % and FPS (Chart.js, vendored locally so it works offline), plus CPU % and CPU temperature.
-- **Sideways‑mount correction** — frames are rotated 90° in software, so the feed is upright even though the camera is mounted sideways.
-- **Continuous autofocus** — keeps frames sharp, which is what makes detection reliable.
+- **Live annotated video** — MJPEG stream with boxes + class + confidence.
+- **Detections panel** — live list of detected objects and scores.
+- **Backend controls** (all live, no restart): max detections, confidence
+  threshold, **model switch** (`yolo26m` ⇄ `yolo26l` ⇄ `yolo11m`), snapshot,
+  pause / resume, rotation (0/90/180/270) and horizontal / vertical flip.
+- **Real-time graphs** — FPS and inference time.
 
 ---
 
-## Requirements
+## Hardware / software
 
-Everything is provided by Raspberry Pi OS packages (apt) — **no virtualenv needed**:
+- **Device:** Seeed reComputer Orin Industrial (Orin NX 16GB), **L4T 35.5.0**,
+  Ubuntu 20.04, CUDA 11.4, **TensorRT 8.5.2**.
+- **Camera:** Basler ace2 GigE (`Mono8`) on a dedicated link-local NIC.
+- **Python:** pypylon, pycuda (built from source), numpy **1.24.x** (with a
+  `np.bool`/`np.float` shim for the TRT 8.5 bindings — see `trt_yolo.py`),
+  opencv, flask.
 
-| Component | Package | Notes |
-|---|---|---|
-| Camera stack | `python3-picamera2` | Pi Camera (tested: IMX708 / Camera Module 3) |
-| Hailo runtime | `python3-h10-hailort` | HailoRT 5.x for the **Hailo‑10H** (AI HAT+ 2) |
-| Web framework | `python3-flask` | |
-| Metrics | `python3-psutil` | RAM / CPU / temperature |
-| Image ops | `python3-opencv` | headless build is fine |
+---
 
-Also required: the Hailo driver loaded (`/dev/hailo0` present) and the HEF models in
-`/usr/share/hailo-models/` (`yolov8m_h10.hef`, `yolov11m_h10.hef`), which ship with
-the `hailo-h10-all` package.
+## Building the detection engines
 
-Verify the NPU before running:
+Model binaries are **not** committed (large, and each `.engine` is specific to
+this exact TensorRT version + GPU). Rebuild them like this:
+
+**1. Export ONNX** (on a workstation with Ultralytics — keeps the Jetson
+torch-free):
 
 ```bash
-hailortcli fw-control identify     # should report Device Architecture: HAILO10H
-ls /dev/hailo0
+python3 -m venv /tmp/yolo-export && source /tmp/yolo-export/bin/activate
+pip install -U ultralytics onnx onnxslim
+# end2end=False keeps the traditional (1,84,8400) head that trt_yolo.py decodes.
+yolo export model=yolo26m.pt format=onnx end2end=False imgsz=640 opset=17 simplify=True half=False
+yolo export model=yolo26l.pt format=onnx end2end=False imgsz=640 opset=17 simplify=True half=False
+scp yolo26m.onnx yolo26l.onnx orinnx1:~/projects/liveobject/models/
 ```
+
+**2. Build the FP16 TensorRT engine** (on the Orin):
+
+```bash
+cd ~/projects/liveobject/models
+/usr/src/tensorrt/bin/trtexec --onnx=yolo26m.onnx --fp16 --saveEngine=yolo26m.engine
+/usr/src/tensorrt/bin/trtexec --onnx=yolo26l.onnx --fp16 --saveEngine=yolo26l.engine
+```
+
+`config.py` auto-detects whichever `*.engine` files exist and offers them in the
+model switcher (default = newest available).
+
+> **Why YOLO26 with `end2end=False`?** YOLO26's default head is NMS-free and
+> emits `(1, 300, 6)`, which this app does not decode and which is riskier to
+> build on TensorRT 8.5. `end2end=False` produces the traditional one-to-many
+> head (`(1, 84, 8400)`) — a drop-in for the existing decoder, with the same mAP.
 
 ---
 
@@ -53,40 +85,38 @@ ls /dev/hailo0
 
 ```bash
 cd ~/projects/liveobject
-python3 app.py          # or ./run.sh
+python3 app.py            # or ./run.sh
 ```
 
-Then open **`http://<pi-ip>:8000/`** from any device on the LAN.
+Or via systemd (`liveobject.service`, port 8000):
 
----
+```bash
+sudo systemctl start liveobject
+```
 
-## Usage
+Open **`http://<orin-ip>:8000/`** from any device on the LAN.
 
-- The video panel shows the live feed with detections drawn on it.
-- Use the **Controls** card to change model, max detections, and threshold — changes apply immediately.
-- **Snapshot** saves the current frame and reveals a **View** link.
-- **Pause** freezes detection (FPS drops to 0); **Resume** restarts it.
-- The **System** card shows live RAM/CPU/temperature and the rolling RAM % and FPS charts.
+> **One camera, one app:** `liveobject.service` declares
+> `Conflicts=baffle-qc.service`, so starting it stops the baffle-qc vision app
+> (they share the single GigE camera), and vice-versa.
 
 ---
 
 ## HTTP API
 
-| Method | Route | Purpose |
-|---|---|---|
-| `GET` | `/` | Dashboard UI |
-| `GET` | `/stream.mjpg` | MJPEG video stream with overlays |
-| `GET` | `/stats` | JSON: fps, infer_ms, ram, cpu, temp, detections, config |
-| `POST` | `/config` | Set `max_detections`, `threshold`, `paused`, or `model` |
-| `POST` | `/snapshot` | Save the current annotated frame; returns its path |
-| `GET` | `/snapshot/latest` | Serve the most recent snapshot |
-
-Example:
+| Method | Route                | Purpose                                                        |
+|--------|----------------------|----------------------------------------------------------------|
+| `GET`  | `/`                  | Dashboard UI                                                   |
+| `GET`  | `/stream.mjpg`       | MJPEG video stream with overlays                               |
+| `GET`  | `/stats`             | JSON: fps, infer_ms, detections, config                        |
+| `POST` | `/config`            | Set `max_detections`, `threshold`, `paused`, `model`, `rotation`, `flip_h`, `flip_v` |
+| `POST` | `/snapshot`          | Save the current annotated frame; returns its path             |
+| `GET`  | `/snapshot/latest`   | Serve the most recent snapshot                                 |
 
 ```bash
-curl -X POST http://<pi-ip>:8000/config \
+curl -X POST http://<orin-ip>:8000/config \
   -H 'Content-Type: application/json' \
-  -d '{"max_detections": 5, "threshold": 0.5, "model": "yolov11m"}'
+  -d '{"model": "yolo26m", "threshold": 0.4, "max_detections": 10}'
 ```
 
 ---
@@ -96,14 +126,14 @@ curl -X POST http://<pi-ip>:8000/config \
 ```
 liveobject/
 ├── app.py                 # Flask routes
-├── detector.py            # DetectionWorker: Picamera2 + Hailo inference thread
-├── config.py              # models, display size, defaults, host/port
+├── detector.py            # DetectionWorker: Basler GigE + TensorRT worker thread
+├── trt_yolo.py            # TensorRT engine load + (1,84,8400) decode + NMS
+├── config.py              # model list, display size, defaults, host/port
 ├── labels.py              # COCO 80 class names
 ├── templates/index.html   # dashboard markup
-├── static/
-│   ├── app.js             # polling, controls, Chart.js graphs
-│   ├── style.css
-│   └── vendor/chart.umd.min.js
+├── static/                # app.js, style.css, vendored Chart.js
+├── models/                # *.engine / *.onnx (gitignored — see "Building" above)
+├── docs/plans/            # design docs
 ├── run.sh
 └── README.md
 ```
@@ -112,18 +142,19 @@ liveobject/
 
 ## How it works
 
-- **Two camera streams**: a `main` stream for display and a 640×640 `lores` stream for the model. Inference runs on the lores stream; boxes are scaled onto the display frame.
-- **All Hailo calls live on one worker thread** (HailoRT objects are thread‑affine). Flask only reads shared state and posts simple config/model/snapshot requests; the worker handles model swaps via a pending flag.
-- **Color order**: Picamera2's `RGB888` arrays are actually BGR‑ordered, so the model is fed `frame[:, :, ::-1]` (RGB) while OpenCV drawing/encoding keep BGR.
-- **NMS output**: the HEFs have YOLOv8 NMS baked in, so `Hailo.run()` returns a list of 80 class arrays, each detection `[y0, x0, y1, x1, score]` normalized 0–1.
+- **Mono → BGR:** the Basler camera streams `Mono8`; frames are converted to BGR
+  and resized to the display size. (Grayscale input caps accuracy on
+  color-dependent classes regardless of model.)
+- **One worker thread:** all CUDA / TensorRT calls live on the `DetectionWorker`
+  thread; the CUDA primary context is pushed/popped around every op. Flask only
+  reads shared state and posts config / model / snapshot requests; model swaps
+  go through a pending flag handled by the worker.
+- **Decode:** the engine outputs `(1, 84, 8400)` (4 box coords + 80 class scores
+  × 8400 anchors); `trt_yolo.py` takes the per-anchor argmax, thresholds, and
+  runs `cv2.dnn.NMSBoxes`.
 
 ---
 
-## Notes
-
-- This uses Flask's built‑in development server, which is fine for personal/LAN use. For an always‑on deployment, run it behind a production WSGI server or wrap it in a `systemd` service.
-- Snapshots (`snapshots/`) and HailoRT logs (`hailort*.log`) are git‑ignored.
-
 ## License
 
-MIT — see `LICENSE` if present, otherwise treat as MIT.
+MIT.

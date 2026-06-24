@@ -6,3 +6,9 @@ __pycache__/
 snapshots/
 *.log
 hailort*.log
+
+# Model weights / engines (large; .engine is specific to this TensorRT/GPU,
+# ONNX/.pt are regenerable — see README "Building the detection engines")
+models/*.engine
+models/*.onnx
+models/*.pt

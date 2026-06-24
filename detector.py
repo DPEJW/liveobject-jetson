@@ -1,11 +1,14 @@
-"""Camera + Hailo-10H detection worker.
+"""Camera + TensorRT detection worker (Jetson port).
 
-Runs Picamera2 and a Hailo YOLO model in a background thread, exposing the
-latest annotated JPEG frame plus structured detections and timing for the web
-layer. All Hailo calls stay on the worker thread; the Flask thread only reads
-shared state and posts simple config/model/snapshot requests.
+Runs the Basler GigE camera (pypylon) and a TensorRT YOLO model in a background
+thread, exposing the latest annotated JPEG frame plus structured detections and
+timing for the web layer. This replaces the Pi's Picamera2 + Hailo-10H path; the
+public DetectionWorker interface (used by app.py) is unchanged.
 """
+from __future__ import annotations
+
 import hashlib
+import sys
 import threading
 import time
 from collections import deque
@@ -13,12 +16,11 @@ from datetime import datetime
 
 import cv2
 import numpy as np
-from picamera2 import Picamera2
-from picamera2.devices import Hailo
 
 from config import (DEFAULTS, DEFAULT_MODEL, DISPLAY_SIZE, MODELS,
                     SNAPSHOT_DIR)
 from labels import COCO_LABELS
+from trt_yolo import TRTYolo
 
 
 def _color_for(name):
@@ -34,21 +36,18 @@ class DetectionWorker:
         self._running = False
         self._thread = None
 
-        # Live config (writes guarded by _lock; scalar reads are atomic enough).
         self.model_key = DEFAULT_MODEL
         self.max_detections = DEFAULTS["max_detections"]
         self.threshold = DEFAULTS["threshold"]
-        self.rotation = DEFAULTS["rotation"]   # degrees clockwise
+        self.rotation = DEFAULTS["rotation"]
         self.flip_h = DEFAULTS["flip_h"]
         self.flip_v = DEFAULTS["flip_v"]
         self.paused = False
 
-        # Requests handled on the worker thread.
         self._pending_model = None
         self._pending_snapshot = False
         self._last_snapshot = None
 
-        # Shared outputs.
         self._jpeg = None
         self._frame_id = 0
         self.detections = []
@@ -81,7 +80,7 @@ class DetectionWorker:
             if paused is not None:
                 self.paused = bool(paused)
             if rotation is not None:
-                self.rotation = (int(rotation) % 360) // 90 * 90  # snap 0/90/180/270
+                self.rotation = (int(rotation) % 360) // 90 * 90
             if flip_h is not None:
                 self.flip_h = bool(flip_h)
             if flip_v is not None:
@@ -125,7 +124,6 @@ class DetectionWorker:
 
     # ---- MJPEG stream ----
     def frames(self):
-        """Yield the latest JPEG bytes as new frames are produced."""
         last_id = -1
         while True:
             with self._cond:
@@ -135,124 +133,112 @@ class DetectionWorker:
             if jpeg is not None:
                 yield jpeg
 
-    # ---- worker thread internals ----
-    def _enable_autofocus(self, picam):
-        """Continuous autofocus on the IMX708 so the model sees sharp frames."""
+    # ---- camera ----
+    def _open_camera(self):
+        from pypylon import pylon
+        self._pylon = pylon
+        cam = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
+        cam.Open()
         try:
-            from libcamera import controls as libcontrols
-            picam.set_controls({
-                "AfMode": libcontrols.AfModeEnum.Continuous,
-                "AfSpeed": libcontrols.AfSpeedEnum.Fast,
-            })
-        except Exception as exc:
-            print(f"autofocus unavailable: {exc}")
+            cam.PixelFormat.Value = "Mono8"
+        except Exception:
+            pass
+        # keep exposure short so the frame rate stays high for live detection
+        try:
+            cam.ExposureAuto.Value = "Continuous"
+            cam.AutoExposureTimeUpperLimit.Value = 20000.0
+            cam.GainAuto.Value = "Continuous"
+            cam.AcquisitionFrameRateEnable.Value = True
+            cam.AcquisitionFrameRate.Value = 30.0
+        except Exception:
+            pass
+        cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+        return cam
 
-    def _load_model(self, key):
-        hailo = Hailo(MODELS[key])
-        h, w, _ = hailo.get_input_shape()
-        return hailo, (w, h)
+    def _grab_bgr(self, cam):
+        res = cam.RetrieveResult(2000, self._pylon.TimeoutHandling_Return)
+        if res is None or not res.GrabSucceeded():
+            if res is not None:
+                res.Release()
+            return None
+        mono = np.array(res.Array, copy=True)
+        res.Release()
+        bgr = cv2.cvtColor(mono, cv2.COLOR_GRAY2BGR)
+        return cv2.resize(bgr, DISPLAY_SIZE, interpolation=cv2.INTER_AREA)
 
+    # ---- worker thread ----
     def _run(self):
-        picam = Picamera2()
-        hailo, (mw, mh) = self._load_model(self.model_key)
-        cfg = picam.create_preview_configuration(
-            main={"size": DISPLAY_SIZE, "format": "RGB888"},
-            lores={"size": (mw, mh), "format": "RGB888"},
-            controls={"FrameRate": 30},
-        )
-        picam.configure(cfg)
-        picam.start()
-        self._enable_autofocus(picam)
-        try:
-            while self._running:
-                if self._pending_model:
-                    hailo, (mw, mh) = self._swap_model(picam, cfg, hailo)
+        model = TRTYolo(MODELS[self.model_key])    # GPU engine: load once
+        while self._running:                       # camera: reconnect on error
+            cam = None
+            try:
+                cam = self._open_camera()
+                while self._running:
+                    if self._pending_model:
+                        with self._lock:
+                            key = self._pending_model
+                            self._pending_model = None
+                        model.reload(MODELS[key])
+                        self.model_key = key
 
-                if self.paused:
-                    time.sleep(0.05)
-                    continue
+                    if self.paused:
+                        time.sleep(0.05)
+                        continue
 
-                req = picam.capture_request()
-                main = req.make_array("main")    # BGR bytes (picamera2 "RGB888")
-                lores = req.make_array("lores")
-                req.release()
+                    frame = self._grab_bgr(cam)
+                    if frame is None:
+                        continue
 
-                k = (-(self.rotation // 90)) % 4   # degrees CW -> np.rot90 steps
-                if k:
-                    main = np.rot90(main, k)
-                    lores = np.rot90(lores, k)
-                if self.flip_h:
-                    main = np.fliplr(main)
-                    lores = np.fliplr(lores)
-                if self.flip_v:
-                    main = np.flipud(main)
-                    lores = np.flipud(lores)
+                    k = (-(self.rotation // 90)) % 4   # degrees CW -> np.rot90 steps
+                    if k:
+                        frame = np.ascontiguousarray(np.rot90(frame, k))
+                    if self.flip_h:
+                        frame = np.ascontiguousarray(np.fliplr(frame))
+                    if self.flip_v:
+                        frame = np.ascontiguousarray(np.flipud(frame))
 
-                # Model expects RGB; picamera2 gives BGR -> reverse channels.
-                model_in = np.ascontiguousarray(lores[:, :, ::-1])
+                    t0 = time.perf_counter()
+                    raw = model.infer(frame, conf=self.threshold)
+                    self.infer_ms = (time.perf_counter() - t0) * 1000.0
 
-                t0 = time.perf_counter()
-                raw = hailo.run(model_in)
-                self.infer_ms = (time.perf_counter() - t0) * 1000.0
+                    dets = self._to_dets(raw)
+                    annotated = self._draw(frame, dets)
 
-                dets = self._parse(raw, main.shape[1], main.shape[0])
-                annotated = self._draw(main, dets)
+                    ok, buf = cv2.imencode(".jpg", annotated,
+                                           [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if ok:
+                        with self._cond:
+                            self._jpeg = buf.tobytes()
+                            self._frame_id += 1
+                            self.detections = dets
+                            self._cond.notify_all()
 
-                ok, buf = cv2.imencode(".jpg", annotated,
-                                       [cv2.IMWRITE_JPEG_QUALITY, 80])
-                if ok:
-                    with self._cond:
-                        self._jpeg = buf.tobytes()
-                        self._frame_id += 1
-                        self.detections = dets
-                        self._cond.notify_all()
+                    if self._pending_snapshot:
+                        self._save_snapshot(annotated)
 
-                if self._pending_snapshot:
-                    self._save_snapshot(annotated)
+                    self._times.append(time.perf_counter())
+            except Exception as e:
+                print(f"[detector] camera/run error: {e}; retrying in 2s",
+                      file=sys.stderr)
+                try:
+                    if cam is not None:
+                        cam.StopGrabbing()
+                        cam.Close()
+                except Exception:
+                    pass
+                time.sleep(2)
 
-                self._times.append(time.perf_counter())
-        finally:
-            picam.stop()
-            hailo.close()
-
-    def _swap_model(self, picam, cfg, hailo):
-        with self._lock:
-            key = self._pending_model
-            self._pending_model = None
-        hailo.close()
-        new_hailo, (mw, mh) = self._load_model(key)
-        self.model_key = key
-        if tuple(cfg["lores"]["size"]) != (mw, mh):
-            picam.stop()
-            cfg["lores"]["size"] = (mw, mh)
-            picam.configure(cfg)
-            picam.start()
-        return new_hailo, (mw, mh)
-
-    def _parse(self, raw, w, h):
-        thr = self.threshold
-        cap = self.max_detections
+    def _to_dets(self, raw):
+        """raw: list of (class_id, score, [x0,y0,x1,y1]) -> sorted, capped dicts."""
         results = []
-        for class_id, dets in enumerate(raw):
-            arr = np.asarray(dets)
-            if arr.size == 0:
-                continue
-            for d in arr:
-                score = float(d[4])
-                if score < thr:
-                    continue
-                y0, x0, y1, x1 = float(d[0]), float(d[1]), float(d[2]), float(d[3])
-                name = COCO_LABELS[class_id] if class_id < len(COCO_LABELS) else str(class_id)
-                results.append({
-                    "name": name,
-                    "score": score,
-                    "box": [int(x0 * w), int(y0 * h), int(x1 * w), int(y1 * h)],
-                })
+        for class_id, score, box in raw:
+            name = COCO_LABELS[class_id] if class_id < len(COCO_LABELS) else str(class_id)
+            results.append({"name": name, "score": score, "box": box})
         results.sort(key=lambda r: r["score"], reverse=True)
-        return results[:cap]
+        return results[:self.max_detections]
 
     def _draw(self, frame, dets):
-        out = frame.copy()  # copy makes the rot90 view contiguous & writable
+        out = frame.copy()
         for d in dets:
             x0, y0, x1, y1 = d["box"]
             color = _color_for(d["name"])
