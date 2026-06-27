@@ -67,6 +67,9 @@ def set_config():
             worker.request_model(data["model"])
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    if "camera_source" in data or "rtsp_stream" in data:
+        worker.request_camera(source=data.get("camera_source"),
+                              stream=data.get("rtsp_stream"))
     cfg = worker.set_config(
         max_detections=data.get("max_detections"),
         threshold=data.get("threshold"),

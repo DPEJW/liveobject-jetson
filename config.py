@@ -82,10 +82,12 @@ def build_rtsp_url(host, port, user, password, stream):
     return f"rtsp://{cred}{host}:{port}/{path}"
 
 
-def rtsp_url():
-    """Effective RTSP URL: full RTSP_URL override if set, else built from parts."""
+def rtsp_url(stream=None):
+    """Effective RTSP URL: full RTSP_URL override if set, else built from parts.
+    `stream` ("main"|"sub") overrides RTSP_STREAM for runtime stream switching."""
     override = os.environ.get("RTSP_URL", "").strip()
-    return override or build_rtsp_url(RTSP_HOST, RTSP_PORT, RTSP_USER, RTSP_PASS, RTSP_STREAM)
+    return override or build_rtsp_url(
+        RTSP_HOST, RTSP_PORT, RTSP_USER, RTSP_PASS, stream or RTSP_STREAM)
 
 
 HOST = "0.0.0.0"

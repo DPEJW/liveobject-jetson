@@ -14,7 +14,7 @@ function colorFor(name) {
   return `rgb(${r},${g},${b})`;
 }
 
-// ---- charts ----
+// ---- charts (instrument palette) ----
 function makeChart(ctx, label, color, suggestedMax) {
   return new Chart(ctx, {
     type: "line",
@@ -22,23 +22,29 @@ function makeChart(ctx, label, color, suggestedMax) {
       labels: Array(WINDOW).fill(""),
       datasets: [{
         label, data: Array(WINDOW).fill(null),
-        borderColor: color, backgroundColor: color + "22",
-        borderWidth: 2, pointRadius: 0, tension: 0.3, fill: true, spanGaps: true,
+        borderColor: color, backgroundColor: color + "1f",
+        borderWidth: 1.5, pointRadius: 0, tension: 0.32, fill: true, spanGaps: true,
       }],
     },
     options: {
       animation: false, responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false }, title: { display: true, text: label, color: "#8b97a6", font: { size: 11 } } },
+      plugins: {
+        legend: { display: false },
+        title: { display: true, text: label, color: "#687a89", align: "start",
+                 font: { family: "'IBM Plex Mono', monospace", size: 10 } },
+      },
       scales: {
         x: { display: false },
-        y: { beginAtZero: true, suggestedMax, ticks: { color: "#8b97a6", maxTicksLimit: 4 }, grid: { color: "#2a323d" } },
+        y: { beginAtZero: true, suggestedMax,
+             ticks: { color: "#455463", maxTicksLimit: 4, font: { size: 9 } },
+             grid: { color: "rgba(110,150,175,.08)" }, border: { display: false } },
       },
     },
   });
 }
 
-const ramChart = makeChart($("ramChart"), "RAM %", "#4aa8ff", 100);
-const fpsChart = makeChart($("fpsChart"), "FPS", "#36d399", 30);
+const fpsChart = makeChart($("fpsChart"), "FPS — 15s", "#ffb02e", 30);
+const ramChart = makeChart($("ramChart"), "RAM % — 15s", "#4fd6c6", 100);
 
 function pushPoint(chart, value) {
   const d = chart.data.datasets[0].data;
@@ -57,13 +63,28 @@ function postConfig(payload) {
   }).then((r) => r.json());
 }
 
-$("maxd").addEventListener("input", (e) => { $("maxd-val").textContent = e.target.value; });
+function setFill(el) {
+  const min = +el.min, max = +el.max;
+  el.style.setProperty("--fill", ((el.value - min) / (max - min) * 100) + "%");
+}
+
+$("maxd").addEventListener("input", (e) => { $("maxd-val").textContent = e.target.value; setFill(e.target); });
 $("maxd").addEventListener("change", (e) => postConfig({ max_detections: +e.target.value }));
 
-$("thr").addEventListener("input", (e) => { $("thr-val").textContent = (e.target.value / 100).toFixed(2); });
+$("thr").addEventListener("input", (e) => { $("thr-val").textContent = (e.target.value / 100).toFixed(2); setFill(e.target); });
 $("thr").addEventListener("change", (e) => postConfig({ threshold: e.target.value / 100 }));
 
 $("model").addEventListener("change", (e) => postConfig({ model: e.target.value }));
+
+// ---- camera source / stream selection ----
+function updateStreamEnabled() {
+  $("stream-ctl").classList.toggle("dim", $("camera-source").value !== "rtsp");
+}
+$("camera-source").addEventListener("change", (e) => {
+  postConfig({ camera_source: e.target.value });
+  updateStreamEnabled();
+});
+$("rtsp-stream").addEventListener("change", (e) => postConfig({ rtsp_stream: e.target.value }));
 
 $("rotate").addEventListener("click", () => {
   const cur = +($("rotate").dataset.rot || 0);
@@ -75,34 +96,29 @@ $("flip-h").addEventListener("click", () => postConfig({ flip_h: !flipH }));
 $("flip-v").addEventListener("click", () => postConfig({ flip_v: !flipV }));
 
 let paused = false;
-$("pause").addEventListener("click", () => {
-  paused = !paused;
-  postConfig({ paused });
-});
+$("pause").addEventListener("click", () => { paused = !paused; postConfig({ paused }); });
 
 $("snap").addEventListener("click", () => {
-  $("snap").textContent = "Saving…";
+  $("snap").textContent = "SAVING…";
   fetch("/snapshot", { method: "POST" })
     .then((r) => r.json())
     .then((j) => {
-      $("snap").textContent = "Snapshot";
+      $("snap").textContent = "SNAPSHOT";
       if (j.path) {
         const link = $("snap-link");
         link.href = "/snapshot/latest?t=" + Date.now();
         link.classList.remove("hidden");
       }
     })
-    .catch(() => { $("snap").textContent = "Snapshot"; });
+    .catch(() => { $("snap").textContent = "SNAPSHOT"; });
 });
 
 // ---- fullscreen ----
 const videoWrap = $("video-wrap");
 const fsExit = $("fs-exit");
-
 function enterFullscreen() {
-  const el = videoWrap;
-  const fn = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
-  if (fn) fn.call(el);
+  const fn = videoWrap.requestFullscreen || videoWrap.webkitRequestFullscreen || videoWrap.msRequestFullscreen;
+  if (fn) fn.call(videoWrap);
 }
 function exitFullscreen() {
   const fn = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen;
@@ -116,16 +132,17 @@ $("fs-btn").addEventListener("click", enterFullscreen);
 fsExit.addEventListener("click", exitFullscreen);
 document.addEventListener("fullscreenchange", onFsChange);
 document.addEventListener("webkitfullscreenchange", onFsChange);
-// (Pressing Esc also exits fullscreen — the browser fires fullscreenchange,
-//  which hides the Exit button and returns you to the dashboard.)
 
-// ---- detections list ----
+// ---- clock ----
+function tick() {
+  $("clock").textContent = new Date().toLocaleTimeString("en-GB");
+}
+setInterval(tick, 1000); tick();
+
+// ---- detections ----
 function renderDetections(dets) {
   const list = $("det-list");
-  if (!dets.length) {
-    list.innerHTML = '<li class="muted">no objects detected</li>';
-    return;
-  }
+  if (!dets.length) { list.innerHTML = '<li class="muted">no objects detected</li>'; return; }
   list.innerHTML = dets.map((d) =>
     `<li><span class="swatch" style="background:${colorFor(d.name)}"></span>` +
     `<span class="nm">${d.name}</span>` +
@@ -133,48 +150,67 @@ function renderDetections(dets) {
   ).join("");
 }
 
-// ---- stats poll ----
+// ---- one-time config hydration ----
 function applyConfigOnce(cfg) {
   if (configInit) return;
   configInit = true;
-  const sel = $("model");
-  sel.innerHTML = cfg.models.map((m) =>
+
+  $("model").innerHTML = cfg.models.map((m) =>
     `<option value="${m}"${m === cfg.model ? " selected" : ""}>${m}</option>`).join("");
-  $("maxd").value = cfg.max_detections; $("maxd-val").textContent = cfg.max_detections;
-  $("thr").value = Math.round(cfg.threshold * 100); $("thr-val").textContent = cfg.threshold.toFixed(2);
+
+  $("camera-source").innerHTML = (cfg.camera_sources || ["rtsp"]).map((s) =>
+    `<option value="${s}"${s === cfg.camera_source ? " selected" : ""}>${s.toUpperCase()}</option>`).join("");
+  $("rtsp-stream").innerHTML = (cfg.rtsp_streams || ["main", "sub"]).map((s) =>
+    `<option value="${s}"${s === cfg.rtsp_stream ? " selected" : ""}>${s.toUpperCase()}</option>`).join("");
+  updateStreamEnabled();
+
+  $("maxd").value = cfg.max_detections; $("maxd-val").textContent = cfg.max_detections; setFill($("maxd"));
+  $("thr").value = Math.round(cfg.threshold * 100); $("thr-val").textContent = cfg.threshold.toFixed(2); setFill($("thr"));
   paused = cfg.paused;
 }
 
+// ---- stats poll ----
 function poll() {
   fetch("/stats").then((r) => r.json()).then((s) => {
+    const cfg = s.config;
     $("status-dot").classList.remove("stale");
+
     $("m-fps").textContent = s.fps.toFixed(1);
-    $("m-infer").textContent = s.infer_ms.toFixed(1);
+    $("m-infer").textContent = s.infer_ms.toFixed(0);
     $("m-count").textContent = s.count;
-    $("m-model").textContent = s.config.model;
+    $("m-model").textContent = cfg.model;
+    $("backend").textContent = cfg.backend || "—";
 
-    $("rotate").dataset.rot = s.config.rotation;
-    $("rot-val").textContent = s.config.rotation + "°";
+    const srcLabel = cfg.camera_source === "rtsp"
+      ? `RTSP / ${(cfg.rtsp_stream || "").toUpperCase()}` : (cfg.camera_source || "").toUpperCase();
+    $("vp-source").textContent = srcLabel;
 
-    flipH = s.config.flip_h; flipV = s.config.flip_v;
+    $("rotate").dataset.rot = cfg.rotation;
+    $("rot-val").textContent = cfg.rotation + "°";
+    flipH = cfg.flip_h; flipV = cfg.flip_v;
     $("flip-h").classList.toggle("on", flipH);
     $("flip-v").classList.toggle("on", flipV);
 
-    $("s-ram").textContent = s.ram_pct.toFixed(0);
-    $("s-rammb").textContent = s.ram_used_mb + " / " + s.ram_total_mb;
-    $("s-cpu").textContent = s.cpu_pct.toFixed(0);
+    const cpu = s.cpu_pct, ram = s.ram_pct;
+    $("s-cpu").textContent = cpu.toFixed(0);
+    $("s-ram").textContent = ram.toFixed(0);
+    $("s-rammb").textContent = s.ram_used_mb;
     $("s-temp").textContent = s.cpu_temp == null ? "—" : s.cpu_temp;
+    $("bar-cpu").style.width = Math.min(100, cpu) + "%";
+    $("bar-ram").style.width = Math.min(100, ram) + "%";
+    $("bar-cpu").classList.toggle("hot", cpu >= 85);
+    $("bar-ram").classList.toggle("hot", ram >= 85);
 
     $("det-count").textContent = s.count;
     renderDetections(s.detections);
 
-    pushPoint(ramChart, s.ram_pct);
     pushPoint(fpsChart, s.fps);
+    pushPoint(ramChart, ram);
 
-    applyConfigOnce(s.config);
+    applyConfigOnce(cfg);
 
-    paused = s.config.paused;
-    $("pause").textContent = paused ? "Resume" : "Pause";
+    paused = cfg.paused;
+    $("pause").textContent = paused ? "RESUME" : "PAUSE";
     $("pause").classList.toggle("paused", paused);
     $("paused-overlay").classList.toggle("hidden", !paused);
   }).catch(() => {

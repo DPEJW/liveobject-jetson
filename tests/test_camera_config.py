@@ -53,6 +53,16 @@ def test_rtsp_url_respects_full_override_env():
         del os.environ["RTSP_URL"]
 
 
+def test_rtsp_url_stream_override_sub():
+    os.environ.pop("RTSP_URL", None)
+    assert config.rtsp_url(stream="sub").endswith("/h264Preview_01_sub")
+
+
+def test_rtsp_url_stream_override_main():
+    os.environ.pop("RTSP_URL", None)
+    assert config.rtsp_url(stream="main").endswith("/h264Preview_01_main")
+
+
 if __name__ == "__main__":
     import traceback
 

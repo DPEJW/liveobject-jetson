@@ -108,18 +108,38 @@ class BaslerSource(CameraSource):
 
 class RtspSource(CameraSource):
     """RTSP/IP camera. Prefers a GStreamer pipeline using the Jetson hardware
-    decoder (NVDEC); falls back to OpenCV's FFMPEG backend (CPU) if GStreamer
-    can't open the stream. Frames are letterboxed to DISPLAY_SIZE."""
+    decoder (NVDEC); falls back to OpenCV's FFMPEG backend (CPU).
 
-    MAX_CONSECUTIVE_FAILS = 30
+    A background thread pulls frames so the detection loop's read() never blocks:
+    OpenCV's read() on a stalled appsink blocks indefinitely (e.g. when the camera
+    hasn't released a prior session during a fast stream switch), which would hang
+    the worker. Here the worker only ever reads the latest cached frame; if it goes
+    stale, read() returns None so the worker rebuilds. Frames are letterboxed."""
+
+    STALE_AFTER = 3.0            # seconds without a fresh frame -> report a miss
+    FIRST_FRAME_TIMEOUT = 8.0    # give up opening if no frame arrives in time
 
     def __init__(self, url):
         self._url = url
-        self._fails = 0
         self.backend = "none"
         self._cap = self._open()
         if self._cap is None or not self._cap.isOpened():
             raise RuntimeError(f"could not open RTSP stream: {self._safe(url)}")
+        self._lock = threading.Lock()
+        self._frame = None
+        self._stamp = 0.0
+        self._stop = False
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+        deadline = time.time() + self.FIRST_FRAME_TIMEOUT
+        while time.time() < deadline:
+            with self._lock:
+                if self._frame is not None:
+                    return
+            time.sleep(0.05)
+        self.close()
+        raise RuntimeError(f"no frames within "
+                           f"{self.FIRST_FRAME_TIMEOUT:.0f}s: {self._safe(url)}")
 
     @staticmethod
     def _safe(url):
@@ -128,9 +148,10 @@ class RtspSource(CameraSource):
     def _gst_pipeline(self):
         # decodebin auto-plugs nvv4l2decoder for H.264/H.265 on Jetson; nvvidconv
         # moves NVMM -> system memory; drop/max-buffers=1 keeps only the freshest
-        # frame so detection never runs on stale video.
+        # frame. tcp-timeout bounds a dead connection so read() can't block forever.
         return (
             f'rtspsrc location="{self._url}" protocols=tcp latency=100 '
+            'tcp-timeout=5000000 timeout=5000000 '
             '! rtpjitterbuffer ! decodebin ! nvvidconv '
             '! video/x-raw,format=BGRx ! videoconvert '
             '! video/x-raw,format=BGR ! appsink drop=true max-buffers=1 sync=false'
@@ -146,7 +167,8 @@ class RtspSource(CameraSource):
         except Exception as e:
             print(f"[rtsp] gstreamer open failed ({e}); falling back to ffmpeg",
                   file=sys.stderr)
-        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS",
+                              "rtsp_transport;tcp|stimeout;5000000")
         cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
         if cap.isOpened():
             try:
@@ -157,31 +179,49 @@ class RtspSource(CameraSource):
             return cap
         return None
 
+    def _read_loop(self):
+        while not self._stop:
+            try:
+                ok, frame = self._cap.read()
+            except Exception:
+                ok, frame = False, None
+            if not ok or frame is None:
+                if self._stop:
+                    break
+                time.sleep(0.02)
+                continue
+            with self._lock:
+                self._frame = frame
+                self._stamp = time.time()
+
     def read(self):
-        ok, frame = self._cap.read()
-        if not ok or frame is None:
-            self._fails += 1
-            if self._fails >= self.MAX_CONSECUTIVE_FAILS:
-                raise RuntimeError("RTSP stream stalled")
+        with self._lock:
+            frame, stamp = self._frame, self._stamp
+        if frame is None or (time.time() - stamp) > self.STALE_AFTER:
             return None
-        self._fails = 0
         return letterbox(frame, DISPLAY_SIZE)
 
     def close(self):
+        self._stop = True
+        try:
+            self._reader.join(timeout=6.0)  # returns within tcp-timeout on a dead link
+        except Exception:
+            pass
         try:
             self._cap.release()
         except Exception:
             pass
 
 
-def make_camera_source():
-    """Build the configured camera source (CAMERA_SOURCE: 'rtsp' | 'basler')."""
-    src = config.CAMERA_SOURCE
+def make_camera_source(source=None, stream=None):
+    """Build a camera source. `source`: 'rtsp' | 'basler' (defaults to config);
+    `stream`: 'main' | 'sub' for RTSP (defaults to config)."""
+    src = source or config.CAMERA_SOURCE
     if src == "basler":
         return BaslerSource()
     if src == "rtsp":
-        return RtspSource(config.rtsp_url())
-    raise ValueError(f"unknown CAMERA_SOURCE {src!r} (expected 'rtsp' or 'basler')")
+        return RtspSource(config.rtsp_url(stream=stream))
+    raise ValueError(f"unknown camera source {src!r} (expected 'rtsp' or 'basler')")
 
 
 class DetectionWorker:
@@ -199,7 +239,12 @@ class DetectionWorker:
         self.flip_v = DEFAULTS["flip_v"]
         self.paused = False
 
+        self.camera_source = config.CAMERA_SOURCE   # 'rtsp' | 'basler'
+        self.rtsp_stream = config.RTSP_STREAM        # 'main' | 'sub'
+        self.backend = ""                            # active decode backend label
+
         self._pending_model = None
+        self._pending_camera = False
         self._pending_snapshot = False
         self._last_snapshot = None
 
@@ -249,6 +294,21 @@ class DetectionWorker:
             self._pending_model = model_key
         return model_key
 
+    def request_camera(self, source=None, stream=None):
+        """Switch capture backend ('rtsp'|'basler') and/or RTSP stream
+        ('main'|'sub') at runtime; the worker reconnects on the next loop."""
+        with self._lock:
+            if source is not None:
+                s = str(source).strip().lower()
+                if s in ("rtsp", "basler"):
+                    self.camera_source = s
+            if stream is not None:
+                st = str(stream).strip().lower()
+                if st in ("main", "sub"):
+                    self.rtsp_stream = st
+            self._pending_camera = True
+        return {"camera_source": self.camera_source, "rtsp_stream": self.rtsp_stream}
+
     def request_snapshot(self):
         with self._lock:
             self._pending_snapshot = True
@@ -264,6 +324,11 @@ class DetectionWorker:
             "rotation": self.rotation,
             "flip_h": self.flip_h,
             "flip_v": self.flip_v,
+            "camera_source": self.camera_source,
+            "camera_sources": ["rtsp", "basler"],
+            "rtsp_stream": self.rtsp_stream,
+            "rtsp_streams": ["main", "sub"],
+            "backend": self.backend,
         }
 
     def fps(self):
@@ -294,11 +359,13 @@ class DetectionWorker:
         while self._running:                       # camera: reconnect on error
             source = None
             try:
-                source = make_camera_source()
-                print(f"[detector] camera source={config.CAMERA_SOURCE}"
-                      + (f" backend={source.backend}" if source.backend else ""),
+                source = make_camera_source(self.camera_source, self.rtsp_stream)
+                self.backend = source.backend
+                print(f"[detector] camera source={self.camera_source}"
+                      + (f"/{self.rtsp_stream}" if self.camera_source == "rtsp" else "")
+                      + (f" backend={self.backend}" if self.backend else ""),
                       file=sys.stderr)
-                while self._running:
+                while self._running and not self._pending_camera:
                     if self._pending_model:
                         with self._lock:
                             key = self._pending_model
@@ -342,9 +409,19 @@ class DetectionWorker:
                         self._save_snapshot(annotated)
 
                     self._times.append(time.perf_counter())
+
+                # left inner loop: stopping, or a camera switch was requested
+                self._pending_camera = False
+                self.backend = ""
+                if source is not None:
+                    source.close()
+                    source = None
+                if self._running:
+                    time.sleep(1.0)  # let the camera release the prior RTSP session
             except Exception as e:
                 print(f"[detector] camera/run error: {e}; retrying in 2s",
                       file=sys.stderr)
+                self.backend = ""
                 try:
                     if source is not None:
                         source.close()
