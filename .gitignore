@@ -7,6 +7,9 @@ snapshots/
 *.log
 hailort*.log
 
+# Camera credentials (local only — never commit real creds)
+.camera.env
+
 # Model weights / engines (large; .engine is specific to this TensorRT/GPU,
 # ONNX/.pt are regenerable — see README "Building the detection engines")
 models/*.engine

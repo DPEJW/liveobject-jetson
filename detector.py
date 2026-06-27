@@ -8,6 +8,8 @@ public DetectionWorker interface (used by app.py) is unchanged.
 from __future__ import annotations
 
 import hashlib
+import os
+import re
 import sys
 import threading
 import time
@@ -17,6 +19,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 
+import config
 from config import (DEFAULTS, DEFAULT_MODEL, DISPLAY_SIZE, MODELS,
                     SNAPSHOT_DIR)
 from labels import COCO_LABELS
@@ -27,6 +30,158 @@ def _color_for(name):
     """Deterministic, readable BGR color per class name (stable across runs)."""
     digest = hashlib.md5(name.encode()).digest()
     return (60 + digest[0] % 180, 60 + digest[1] % 180, 60 + digest[2] % 180)
+
+
+def letterbox(frame, size):
+    """Resize `frame` (BGR ndarray) to fit `size`=(width, height) while preserving
+    aspect ratio, padding the remainder with black. Returns an array of exactly
+    (height, width, 3). Keeps non-16:9 cameras (e.g. a 4:3 Reolink) from being
+    horizontally squished into the display frame."""
+    tw, th = size
+    h, w = frame.shape[:2]
+    scale = min(tw / w, th / h)
+    nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+    out = np.zeros((th, tw, 3), dtype=frame.dtype)
+    x0, y0 = (tw - nw) // 2, (th - nh) // 2
+    out[y0:y0 + nh, x0:x0 + nw] = resized
+    return out
+
+
+class CameraSource:
+    """Frame-source interface. `read()` returns a BGR ndarray sized to
+    DISPLAY_SIZE (or None for a transient miss); `close()` releases the device."""
+
+    backend = ""
+
+    def read(self):
+        raise NotImplementedError
+
+    def close(self):
+        pass
+
+
+class BaslerSource(CameraSource):
+    """Basler GigE Vision camera via pypylon (Mono8 -> BGR). Original capture path."""
+
+    backend = "pypylon"
+
+    def __init__(self):
+        from pypylon import pylon
+        self._pylon = pylon
+        cam = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
+        cam.Open()
+        try:
+            cam.PixelFormat.Value = "Mono8"
+        except Exception:
+            pass
+        # keep exposure short so the frame rate stays high for live detection
+        try:
+            cam.ExposureAuto.Value = "Continuous"
+            cam.AutoExposureTimeUpperLimit.Value = 20000.0
+            cam.GainAuto.Value = "Continuous"
+            cam.AcquisitionFrameRateEnable.Value = True
+            cam.AcquisitionFrameRate.Value = 30.0
+        except Exception:
+            pass
+        cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+        self._cam = cam
+
+    def read(self):
+        res = self._cam.RetrieveResult(2000, self._pylon.TimeoutHandling_Return)
+        if res is None or not res.GrabSucceeded():
+            if res is not None:
+                res.Release()
+            return None
+        mono = np.array(res.Array, copy=True)
+        res.Release()
+        bgr = cv2.cvtColor(mono, cv2.COLOR_GRAY2BGR)
+        return cv2.resize(bgr, DISPLAY_SIZE, interpolation=cv2.INTER_AREA)
+
+    def close(self):
+        try:
+            self._cam.StopGrabbing()
+            self._cam.Close()
+        except Exception:
+            pass
+
+
+class RtspSource(CameraSource):
+    """RTSP/IP camera. Prefers a GStreamer pipeline using the Jetson hardware
+    decoder (NVDEC); falls back to OpenCV's FFMPEG backend (CPU) if GStreamer
+    can't open the stream. Frames are letterboxed to DISPLAY_SIZE."""
+
+    MAX_CONSECUTIVE_FAILS = 30
+
+    def __init__(self, url):
+        self._url = url
+        self._fails = 0
+        self.backend = "none"
+        self._cap = self._open()
+        if self._cap is None or not self._cap.isOpened():
+            raise RuntimeError(f"could not open RTSP stream: {self._safe(url)}")
+
+    @staticmethod
+    def _safe(url):
+        return re.sub(r"://[^@/]+@", "://***@", url)  # strip creds for logs
+
+    def _gst_pipeline(self):
+        # decodebin auto-plugs nvv4l2decoder for H.264/H.265 on Jetson; nvvidconv
+        # moves NVMM -> system memory; drop/max-buffers=1 keeps only the freshest
+        # frame so detection never runs on stale video.
+        return (
+            f'rtspsrc location="{self._url}" protocols=tcp latency=100 '
+            '! rtpjitterbuffer ! decodebin ! nvvidconv '
+            '! video/x-raw,format=BGRx ! videoconvert '
+            '! video/x-raw,format=BGR ! appsink drop=true max-buffers=1 sync=false'
+        )
+
+    def _open(self):
+        try:
+            cap = cv2.VideoCapture(self._gst_pipeline(), cv2.CAP_GSTREAMER)
+            if cap.isOpened():
+                self.backend = "gstreamer-nvdec"
+                return cap
+            cap.release()
+        except Exception as e:
+            print(f"[rtsp] gstreamer open failed ({e}); falling back to ffmpeg",
+                  file=sys.stderr)
+        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+        cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
+        if cap.isOpened():
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            self.backend = "ffmpeg-cpu"
+            return cap
+        return None
+
+    def read(self):
+        ok, frame = self._cap.read()
+        if not ok or frame is None:
+            self._fails += 1
+            if self._fails >= self.MAX_CONSECUTIVE_FAILS:
+                raise RuntimeError("RTSP stream stalled")
+            return None
+        self._fails = 0
+        return letterbox(frame, DISPLAY_SIZE)
+
+    def close(self):
+        try:
+            self._cap.release()
+        except Exception:
+            pass
+
+
+def make_camera_source():
+    """Build the configured camera source (CAMERA_SOURCE: 'rtsp' | 'basler')."""
+    src = config.CAMERA_SOURCE
+    if src == "basler":
+        return BaslerSource()
+    if src == "rtsp":
+        return RtspSource(config.rtsp_url())
+    raise ValueError(f"unknown CAMERA_SOURCE {src!r} (expected 'rtsp' or 'basler')")
 
 
 class DetectionWorker:
@@ -133,46 +288,16 @@ class DetectionWorker:
             if jpeg is not None:
                 yield jpeg
 
-    # ---- camera ----
-    def _open_camera(self):
-        from pypylon import pylon
-        self._pylon = pylon
-        cam = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
-        cam.Open()
-        try:
-            cam.PixelFormat.Value = "Mono8"
-        except Exception:
-            pass
-        # keep exposure short so the frame rate stays high for live detection
-        try:
-            cam.ExposureAuto.Value = "Continuous"
-            cam.AutoExposureTimeUpperLimit.Value = 20000.0
-            cam.GainAuto.Value = "Continuous"
-            cam.AcquisitionFrameRateEnable.Value = True
-            cam.AcquisitionFrameRate.Value = 30.0
-        except Exception:
-            pass
-        cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
-        return cam
-
-    def _grab_bgr(self, cam):
-        res = cam.RetrieveResult(2000, self._pylon.TimeoutHandling_Return)
-        if res is None or not res.GrabSucceeded():
-            if res is not None:
-                res.Release()
-            return None
-        mono = np.array(res.Array, copy=True)
-        res.Release()
-        bgr = cv2.cvtColor(mono, cv2.COLOR_GRAY2BGR)
-        return cv2.resize(bgr, DISPLAY_SIZE, interpolation=cv2.INTER_AREA)
-
     # ---- worker thread ----
     def _run(self):
         model = TRTYolo(MODELS[self.model_key])    # GPU engine: load once
         while self._running:                       # camera: reconnect on error
-            cam = None
+            source = None
             try:
-                cam = self._open_camera()
+                source = make_camera_source()
+                print(f"[detector] camera source={config.CAMERA_SOURCE}"
+                      + (f" backend={source.backend}" if source.backend else ""),
+                      file=sys.stderr)
                 while self._running:
                     if self._pending_model:
                         with self._lock:
@@ -185,7 +310,7 @@ class DetectionWorker:
                         time.sleep(0.05)
                         continue
 
-                    frame = self._grab_bgr(cam)
+                    frame = source.read()
                     if frame is None:
                         continue
 
@@ -221,9 +346,8 @@ class DetectionWorker:
                 print(f"[detector] camera/run error: {e}; retrying in 2s",
                       file=sys.stderr)
                 try:
-                    if cam is not None:
-                        cam.StopGrabbing()
-                        cam.Close()
+                    if source is not None:
+                        source.close()
                 except Exception:
                     pass
                 time.sleep(2)
