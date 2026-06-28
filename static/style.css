@@ -310,3 +310,14 @@ input[type=range]::-moz-range-thumb {
   body, .card { animation: none; }
   .dot, .vp-live i, .reactor { animation: none; }
 }
+
+/* ---- tracking card ---- */
+.trk-list { list-style: none; margin: 0 0 10px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.trk-list li { display: flex; align-items: center; gap: 8px; padding: 6px 9px; background: var(--inset);
+               cursor: pointer; font-size: 12px; letter-spacing: .5px; }
+.trk-list li.sel { outline: 1px solid var(--cyan); color: var(--cyan); }
+.trk-list li .sc { margin-left: auto; color: var(--ink-dim); }
+.trk-list li.muted { cursor: default; color: var(--ink-faint); }
+.trk-readout { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-bottom: 8px; }
+.trk-readout .ro:last-child { grid-column: 1 / -1; }
+.trk-toggles .btn.on { color: var(--cyan); border-color: var(--cyan); }
