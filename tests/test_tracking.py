@@ -7,7 +7,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tracking import iou, centroid, IoUTracker, TrackSession, ZoneRegistry
+from tracking import iou, centroid, IoUTracker, TrackSession, ZoneRegistry, hit_test
 
 
 def test_iou_and_centroid_basics():
@@ -112,6 +112,15 @@ def test_manual_zone_add_rename_delete_and_no_expire():
     assert any(z["label"] == "food bowl" for z in zr.list())
     zr.rename(zid, "bowl"); assert any(z["label"] == "bowl" for z in zr.list())
     zr.delete(zid); assert zr.list() == []
+
+
+def test_hit_test_picks_smallest_containing_box():
+    tracks = [{"id": 1, "box": [0, 0, 1280, 720]},
+              {"id": 2, "box": [600, 300, 700, 420]}]
+    assert hit_test(tracks, 0.51, 0.5, 1280, 720) == 2     # inside small box
+    assert hit_test(tracks, 0.05, 0.05, 1280, 720) == 1    # only big box
+    assert hit_test(tracks, 0.99, 0.99, 1280, 720) == 1
+    assert hit_test([], 0.5, 0.5, 1280, 720) is None
 
 
 if __name__ == "__main__":

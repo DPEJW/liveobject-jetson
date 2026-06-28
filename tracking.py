@@ -246,3 +246,16 @@ class ZoneRegistry:
         return [{"id": z["id"], "label": z["label"],
                  "box": [int(round(v)) for v in z["box"]], "source": z["source"]}
                 for z in self.zones.values()]
+
+
+def hit_test(tracks, nx, ny, frame_w, frame_h):
+    """nx, ny normalized [0,1]; returns id of the smallest box containing the point."""
+    px, py = nx * frame_w, ny * frame_h
+    best, best_area = None, None
+    for t in tracks:
+        x0, y0, x1, y1 = t["box"]
+        if x0 <= px <= x1 and y0 <= py <= y1:
+            area = (x1 - x0) * (y1 - y0)
+            if best_area is None or area < best_area:
+                best, best_area = t["id"], area
+    return best
