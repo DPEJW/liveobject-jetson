@@ -23,7 +23,11 @@ import config
 from config import (DEFAULTS, DEFAULT_MODEL, DISPLAY_SIZE, MODELS,
                     SNAPSHOT_DIR)
 from labels import COCO_LABELS
+from tracking import IoUTracker, TrackSession, ZoneRegistry, hit_test
 from trt_yolo import TRTYolo
+
+# COCO classes used as auto "named places" for dwell tracking
+ZONE_CLASSES = {"chair", "couch", "bed", "dining table"}
 
 
 def _color_for(name):
@@ -254,6 +258,22 @@ class DetectionWorker:
         self.infer_ms = 0.0
         self._times = deque(maxlen=90)
 
+        # ---- tracking state (mutated only by the worker thread) ----
+        self.tracker = IoUTracker()
+        self.zones = ZoneRegistry()
+        self._selected_id = None
+        self._session = None
+        self._last_tracks = []
+        self._track_snapshot = {"tracks": [], "track": None, "zones": []}
+        self._fw, self._fh = DISPLAY_SIZE
+        self._t_prev = None
+        self._pending_select = None     # None | {"id":int} | {"x":float,"y":float}
+        self._pending_stop = False
+        self._pending_zone_ops = []
+        self.show_trail = True
+        self.show_heatmap = True
+        self.show_zones = True
+
         SNAPSHOT_DIR.mkdir(exist_ok=True)
 
     # ---- lifecycle ----
@@ -271,7 +291,8 @@ class DetectionWorker:
 
     # ---- config API (called from the Flask thread) ----
     def set_config(self, max_detections=None, threshold=None, paused=None,
-                   rotation=None, flip_h=None, flip_v=None):
+                   rotation=None, flip_h=None, flip_v=None,
+                   track_trail=None, track_heatmap=None, track_zones=None):
         with self._lock:
             if max_detections is not None:
                 self.max_detections = max(1, min(100, int(max_detections)))
@@ -280,11 +301,20 @@ class DetectionWorker:
             if paused is not None:
                 self.paused = bool(paused)
             if rotation is not None:
-                self.rotation = (int(rotation) % 360) // 90 * 90
+                new_rot = (int(rotation) % 360) // 90 * 90
+                if new_rot != self.rotation:
+                    self.rotation = new_rot
+                    self._reset_tracking()        # geometry changed -> zones invalid
             if flip_h is not None:
                 self.flip_h = bool(flip_h)
             if flip_v is not None:
                 self.flip_v = bool(flip_v)
+            if track_trail is not None:
+                self.show_trail = bool(track_trail)
+            if track_heatmap is not None:
+                self.show_heatmap = bool(track_heatmap)
+            if track_zones is not None:
+                self.show_zones = bool(track_zones)
         return self.config()
 
     def request_model(self, model_key):
@@ -306,6 +336,7 @@ class DetectionWorker:
                 st = str(stream).strip().lower()
                 if st in ("main", "sub"):
                     self.rtsp_stream = st
+            self._reset_tracking()                 # new scene -> drop session + zones
             self._pending_camera = True
         return {"camera_source": self.camera_source, "rtsp_stream": self.rtsp_stream}
 
@@ -313,6 +344,86 @@ class DetectionWorker:
         with self._lock:
             self._pending_snapshot = True
             self._last_snapshot = None
+
+    # ---- tracking control (Flask thread queues; worker applies) ----
+    def request_select(self, track_id=None, x=None, y=None):
+        with self._lock:
+            if track_id is not None:
+                self._pending_select = {"id": int(track_id)}
+            elif x is not None and y is not None:
+                self._pending_select = {"x": float(x), "y": float(y)}
+            else:
+                return {"selected": None}
+        return {"queued": True}
+
+    def request_stop_tracking(self):
+        with self._lock:
+            self._pending_stop = True
+        return {"queued": True}
+
+    def zone_add(self, label, box):
+        with self._lock:
+            self._pending_zone_ops.append(("add", str(label), [int(v) for v in box]))
+        return {"queued": True}
+
+    def zone_rename(self, zid, label):
+        with self._lock:
+            self._pending_zone_ops.append(("rename", int(zid), str(label)))
+        return {"queued": True}
+
+    def zone_delete(self, zid):
+        with self._lock:
+            self._pending_zone_ops.append(("delete", int(zid)))
+        return {"queued": True}
+
+    def tracking_state(self):
+        return self._track_snapshot      # atomically swapped reference; read-only
+
+    # ---- worker-thread helpers (caller holds self._lock) ----
+    def _reset_tracking(self):
+        """Scene changed (camera/rotation): drop session + zones."""
+        self.tracker = IoUTracker()
+        self.zones = ZoneRegistry()
+        self._selected_id = None
+        self._session = None
+        self._last_tracks = []
+        self._pending_select = None
+        self._pending_stop = False
+        self._pending_zone_ops = []
+        self._track_snapshot = {"tracks": [], "track": None, "zones": []}
+
+    def _apply_pending(self, tracked):
+        for op in self._pending_zone_ops:
+            if op[0] == "add":
+                self.zones.add(op[1], op[2])
+            elif op[0] == "rename":
+                self.zones.rename(op[1], op[2])
+            elif op[0] == "delete":
+                self.zones.delete(op[1])
+        self._pending_zone_ops = []
+        if self._pending_stop:
+            if self._session is not None:
+                self._session.stop()
+            self._selected_id = None
+            self._pending_stop = False
+        if self._pending_select is not None:
+            sel, self._pending_select = self._pending_select, None
+            tid = sel.get("id")
+            if tid is None:
+                tid = hit_test(tracked, sel["x"], sel["y"], self._fw, self._fh)
+            if tid is not None:
+                t = self.tracker.get(int(tid))
+                self._selected_id = int(tid)
+                self._session = TrackSession(int(tid), t.label if t else f"#{tid}",
+                                             self._fw, self._fh)
+                self._t_prev = None
+
+    def _build_snapshot(self, tracked):
+        tracks = [{"id": d["id"], "label": d["label"], "cls": d["name"],
+                   "score": round(d["score"], 2), "box": [int(v) for v in d["box"]],
+                   "selected": d["id"] == self._selected_id} for d in tracked]
+        summary = self._session.summary() if self._session is not None else None
+        return {"tracks": tracks, "track": summary, "zones": self.zones.list()}
 
     def config(self):
         return {
@@ -329,6 +440,9 @@ class DetectionWorker:
             "rtsp_stream": self.rtsp_stream,
             "rtsp_streams": ["main", "sub"],
             "backend": self.backend,
+            "track_trail": self.show_trail,
+            "track_heatmap": self.show_heatmap,
+            "track_zones": self.show_zones,
         }
 
     def fps(self):
@@ -394,7 +508,27 @@ class DetectionWorker:
                     self.infer_ms = (time.perf_counter() - t0) * 1000.0
 
                     dets = self._to_dets(raw)
-                    annotated = self._draw(frame, dets)
+                    self._fh, self._fw = frame.shape[0], frame.shape[1]
+                    now = time.perf_counter()
+                    dt = (now - self._t_prev) if self._t_prev else 0.0
+                    self._t_prev = now
+
+                    with self._lock:
+                        tracked = self.tracker.update(dets)
+                        self._last_tracks = tracked
+                        self._apply_pending(tracked)
+                        self.zones.update_auto([d for d in tracked
+                                                if d["name"] in ZONE_CLASSES])
+                        if (self._selected_id is not None and self._session is not None
+                                and self._session.state != "stopped"):
+                            sel = self.tracker.get(self._selected_id)
+                            if sel is not None:
+                                self._session.update(sel.box, dt, self.zones.list())
+                            else:
+                                self._session.mark_lost()
+                        self._track_snapshot = self._build_snapshot(tracked)
+
+                    annotated = self._draw(frame, tracked)
 
                     ok, buf = cv2.imencode(".jpg", annotated,
                                            [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -402,7 +536,7 @@ class DetectionWorker:
                         with self._cond:
                             self._jpeg = buf.tobytes()
                             self._frame_id += 1
-                            self.detections = dets
+                            self.detections = tracked
                             self._cond.notify_all()
 
                     if self._pending_snapshot:
@@ -440,16 +574,42 @@ class DetectionWorker:
 
     def _draw(self, frame, dets):
         out = frame.copy()
+        sess = self._session            # capture once (worker thread; avoids None-race)
+        sel = self._selected_id
+        cyan = (198, 214, 79)           # BGR for UI #4fd6c6
+        if self.show_heatmap and sess is not None:
+            out = self._render_heatmap(out, sess.heat)
+        if self.show_zones:
+            for z in self.zones.list():
+                x0, y0, x1, y1 = z["box"]
+                cv2.rectangle(out, (x0, y0), (x1, y1), (90, 200, 255), 1)
+                cv2.putText(out, z["label"], (x0 + 3, y0 + 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (90, 200, 255), 1, cv2.LINE_AA)
+        if self.show_trail and sess is not None and len(sess.trail) > 1:
+            pts = np.array(sess.trail, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(out, [pts], False, cyan, 2, cv2.LINE_AA)
         for d in dets:
-            x0, y0, x1, y1 = d["box"]
-            color = _color_for(d["name"])
-            cv2.rectangle(out, (x0, y0), (x1, y1), color, 2)
-            label = f'{d["name"]} {d["score"] * 100:.0f}%'
+            x0, y0, x1, y1 = [int(v) for v in d["box"]]
+            is_sel = d.get("id") == sel
+            color = cyan if is_sel else _color_for(d["name"])
+            cv2.rectangle(out, (x0, y0), (x1, y1), color, 3 if is_sel else 2)
+            label = f'{d.get("label", d["name"])} {d["score"] * 100:.0f}%'
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2.rectangle(out, (x0, max(0, y0 - th - 6)), (x0 + tw + 4, y0), color, -1)
             cv2.putText(out, label, (x0 + 2, max(10, y0 - 4)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
         return out
+
+    def _render_heatmap(self, frame, heat, alpha=0.45):
+        m = float(heat.max())
+        if m <= 0:
+            return frame
+        small = (np.clip(heat / m, 0, 1) * 255).astype(np.uint8)
+        big = cv2.resize(small, (frame.shape[1], frame.shape[0]),
+                         interpolation=cv2.INTER_LINEAR)
+        cmap = cv2.applyColorMap(big, cv2.COLORMAP_TURBO)
+        mask = (big > 8)[:, :, None]
+        return np.where(mask, cv2.addWeighted(frame, 1 - alpha, cmap, alpha, 0), frame)
 
     def _save_snapshot(self, frame):
         with self._lock:
