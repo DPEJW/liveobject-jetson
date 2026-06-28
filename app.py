@@ -45,7 +45,7 @@ def stream():
 @app.route("/stats")
 def stats():
     vm = psutil.virtual_memory()
-    return jsonify({
+    payload = {
         "fps": round(worker.fps(), 1),
         "infer_ms": round(worker.infer_ms, 1),
         "ram_used_mb": round(vm.used / 1048576),
@@ -56,7 +56,9 @@ def stats():
         "count": len(worker.detections),
         "detections": worker.detections,
         "config": worker.config(),
-    })
+    }
+    payload.update(worker.tracking_state())
+    return jsonify(payload)
 
 
 @app.route("/config", methods=["POST"])
@@ -77,6 +79,9 @@ def set_config():
         rotation=data.get("rotation"),
         flip_h=data.get("flip_h"),
         flip_v=data.get("flip_v"),
+        track_trail=data.get("track_trail"),
+        track_heatmap=data.get("track_heatmap"),
+        track_zones=data.get("track_zones"),
     )
     return jsonify(cfg)
 
@@ -97,6 +102,31 @@ def snapshot_latest():
     if not path:
         return ("no snapshot yet", 404)
     return send_file(path, mimetype="image/jpeg")
+
+
+@app.route("/track", methods=["POST"])
+def track():
+    data = request.get_json(force=True, silent=True) or {}
+    action = data.get("action")
+    if action == "stop":
+        return jsonify(worker.request_stop_tracking())
+    if action == "select":
+        return jsonify(worker.request_select(track_id=data.get("id"),
+                                             x=data.get("x"), y=data.get("y")))
+    return jsonify({"error": "unknown action"}), 400
+
+
+@app.route("/zones", methods=["POST"])
+def zones():
+    data = request.get_json(force=True, silent=True) or {}
+    action = data.get("action")
+    if action == "add" and data.get("box"):
+        return jsonify(worker.zone_add(data.get("label", "zone"), data["box"]))
+    if action == "rename" and data.get("id") is not None:
+        return jsonify(worker.zone_rename(data["id"], data.get("label", "")))
+    if action == "delete" and data.get("id") is not None:
+        return jsonify(worker.zone_delete(data["id"]))
+    return jsonify({"error": "unknown action"}), 400
 
 
 if __name__ == "__main__":
