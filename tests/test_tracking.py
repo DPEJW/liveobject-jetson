@@ -7,7 +7,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tracking import iou, centroid, IoUTracker, TrackSession
+from tracking import iou, centroid, IoUTracker, TrackSession, ZoneRegistry
 
 
 def test_iou_and_centroid_basics():
@@ -87,6 +87,31 @@ def test_lost_then_reacquire_does_not_count_the_jump():
     s.mark_lost()
     s.update([900, 600, 940, 640], dt=0.1, zones=[])       # big jump after loss
     assert s.path_px < 1.0, "the re-acquire jump must not count as travel"
+
+
+def test_auto_zone_created_and_smoothed():
+    zr = ZoneRegistry(ema=0.5, expire_s=30)
+    zr.update_auto([{"name": "couch", "score": .9, "box": [100, 100, 300, 200]}], now=0)
+    zr.update_auto([{"name": "couch", "score": .9, "box": [110, 100, 310, 200]}], now=1)
+    z = zr.list()
+    assert len(z) == 1 and z[0]["label"] == "couch" and z[0]["source"] == "auto"
+    assert 104 <= z[0]["box"][0] <= 106          # EMA between 100 and 110
+
+
+def test_auto_zone_survives_brief_absence_then_expires():
+    zr = ZoneRegistry(expire_s=10)
+    zr.update_auto([{"name": "couch", "score": .9, "box": [0, 0, 50, 50]}], now=0)
+    zr.update_auto([], now=5);  assert len(zr.list()) == 1     # still there
+    zr.update_auto([], now=20); assert len(zr.list()) == 0     # expired
+
+
+def test_manual_zone_add_rename_delete_and_no_expire():
+    zr = ZoneRegistry(expire_s=1)
+    zid = zr.add("food bowl", [10, 10, 60, 60])
+    zr.update_auto([], now=999)                  # manual must NOT expire
+    assert any(z["label"] == "food bowl" for z in zr.list())
+    zr.rename(zid, "bowl"); assert any(z["label"] == "bowl" for z in zr.list())
+    zr.delete(zid); assert zr.list() == []
 
 
 if __name__ == "__main__":

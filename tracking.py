@@ -187,3 +187,62 @@ class TrackSession:
             d["dist_m"] = round(self.path_px * self.meters_per_pixel, 2)
             d["net_m"] = round(self.net_px() * self.meters_per_pixel, 2)
         return d
+
+
+class ZoneRegistry:
+    """Named places: auto-detected furniture (EMA-smoothed, slow-expiring) plus
+    user-managed manual zones (never auto-expire)."""
+
+    def __init__(self, ema=0.2, expire_s=30.0, match_iou=0.3):
+        self.ema, self.expire_s, self.match_iou = ema, expire_s, match_iou
+        self.zones = {}                  # id -> dict
+        self._next_id = 1
+        self._counts = defaultdict(int)
+
+    def _match(self, cls, box):
+        best, best_ov = None, 0.0
+        for z in self.zones.values():
+            if z["source"] == "auto" and z["cls"] == cls:
+                ov = iou(box, z["box"])
+                if ov > best_ov:
+                    best, best_ov = z, ov
+        return best if best_ov >= self.match_iou else None
+
+    def update_auto(self, furniture_dets, now=None):
+        now = time.time() if now is None else now
+        for d in furniture_dets:
+            z = self._match(d["name"], d["box"])
+            if z is None:
+                self._counts[d["name"]] += 1
+                n = self._counts[d["name"]]
+                label = d["name"] if n == 1 else f'{d["name"]} #{n}'
+                zid = self._next_id
+                self._next_id += 1
+                self.zones[zid] = {"id": zid, "label": label, "box": list(d["box"]),
+                                   "source": "auto", "cls": d["name"], "last_seen": now}
+            else:
+                a = self.ema
+                z["box"] = [(1 - a) * o + a * n for o, n in zip(z["box"], d["box"])]
+                z["last_seen"] = now
+        for zid in [zid for zid, z in self.zones.items()
+                    if z["source"] == "auto" and now - z["last_seen"] > self.expire_s]:
+            del self.zones[zid]
+
+    def add(self, label, box):
+        zid = self._next_id
+        self._next_id += 1
+        self.zones[zid] = {"id": zid, "label": label, "box": list(box),
+                           "source": "manual", "cls": None, "last_seen": time.time()}
+        return zid
+
+    def rename(self, zid, label):
+        if zid in self.zones:
+            self.zones[zid]["label"] = label
+
+    def delete(self, zid):
+        self.zones.pop(zid, None)
+
+    def list(self):
+        return [{"id": z["id"], "label": z["label"],
+                 "box": [int(round(v)) for v in z["box"]], "source": z["source"]}
+                for z in self.zones.values()]
