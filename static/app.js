@@ -63,6 +63,19 @@ function postConfig(payload) {
   }).then((r) => r.json());
 }
 
+function postTrack(body) {
+  return fetch("/track", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then((r) => r.json());
+}
+
+function fmtDur(s) {
+  return s >= 60 ? `${Math.floor(s / 60)}m${String(Math.round(s % 60)).padStart(2, "0")}s`
+                 : `${(s || 0).toFixed(0)}s`;
+}
+
 function setFill(el) {
   const min = +el.min, max = +el.max;
   el.style.setProperty("--fill", ((el.value - min) / (max - min) * 100) + "%");
@@ -85,6 +98,29 @@ $("camera-source").addEventListener("change", (e) => {
   updateStreamEnabled();
 });
 $("rtsp-stream").addEventListener("change", (e) => postConfig({ rtsp_stream: e.target.value }));
+
+// ---- tracking controls ----
+$("stream").addEventListener("click", (e) => {
+  const r = e.currentTarget.getBoundingClientRect();
+  postTrack({ action: "select",
+              x: (e.clientX - r.left) / r.width,
+              y: (e.clientY - r.top) / r.height });
+});
+$("trk-stop").addEventListener("click", () => postTrack({ action: "stop" }));
+$("trk-list").addEventListener("click", (e) => {           // event delegation
+  const li = e.target.closest("li[data-id]");
+  if (li) postTrack({ action: "select", id: +li.dataset.id });
+});
+function wireToggle(id, key) {
+  $(id).addEventListener("click", () => {
+    const on = !$(id).classList.contains("on");
+    $(id).classList.toggle("on", on);
+    postConfig({ [key]: on });
+  });
+}
+wireToggle("tg-trail", "track_trail");
+wireToggle("tg-heatmap", "track_heatmap");
+wireToggle("tg-zones", "track_zones");
 
 $("rotate").addEventListener("click", () => {
   const cur = +($("rotate").dataset.rot || 0);
@@ -167,6 +203,9 @@ function applyConfigOnce(cfg) {
   $("maxd").value = cfg.max_detections; $("maxd-val").textContent = cfg.max_detections; setFill($("maxd"));
   $("thr").value = Math.round(cfg.threshold * 100); $("thr-val").textContent = cfg.threshold.toFixed(2); setFill($("thr"));
   paused = cfg.paused;
+  $("tg-trail").classList.toggle("on", cfg.track_trail);
+  $("tg-heatmap").classList.toggle("on", cfg.track_heatmap);
+  $("tg-zones").classList.toggle("on", cfg.track_zones);
 }
 
 // ---- stats poll ----
@@ -203,6 +242,31 @@ function poll() {
 
     $("det-count").textContent = s.count;
     renderDetections(s.detections);
+
+    // ---- tracking ----
+    const tracks = s.tracks || [];
+    $("trk-list").innerHTML = tracks.length
+      ? tracks.map((t) =>
+          `<li data-id="${t.id}" class="${t.selected ? "sel" : ""}">`
+          + `<span class="swatch" style="background:${colorFor(t.cls)}"></span>`
+          + `<span class="nm">${t.label}</span>`
+          + `<span class="sc">${(t.score * 100).toFixed(0)}%</span></li>`).join("")
+      : '<li class="muted">no objects yet</li>';
+
+    const tk = s.track;
+    $("trk-readout").classList.toggle("hidden", !tk);
+    $("trk-stop").classList.toggle("hidden", !tk || tk.state === "stopped");
+    $("trk-state").textContent = tk ? tk.state : "idle";
+    if (tk) {
+      $("trk-elapsed").textContent = fmtDur(tk.elapsed_s);
+      $("trk-moving").textContent = fmtDur(tk.moving_s);
+      $("trk-still").textContent = fmtDur(tk.still_s);
+      $("trk-dist").textContent = `${tk.dist_px.toFixed(0)}px · ${tk.dist_frames}×`;
+      $("trk-place").textContent = tk.current_zone || "—";
+      $("trk-zones").innerHTML = (tk.zones || []).map((z) =>
+        `<li><span class="nm">${z.label}</span>`
+        + `<span class="sc">${fmtDur(z.dwell_s)}</span></li>`).join("");
+    }
 
     pushPoint(fpsChart, s.fps);
     pushPoint(ramChart, ram);
