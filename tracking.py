@@ -93,3 +93,97 @@ class IoUTracker:
 
     def get(self, tid):
         return self.tracks.get(tid)
+
+
+class TrackSession:
+    """Accumulates motion + dwell metrics for one selected track over time."""
+
+    def __init__(self, track_id, label, frame_w, frame_h,
+                 dead_band_frac=0.005, heatmap_size=(64, 36), meters_per_pixel=None):
+        import numpy as np
+        self._np = np
+        self.track_id, self.label = track_id, label
+        self.frame_w, self.frame_h = frame_w, frame_h
+        self.diag = math.hypot(frame_w, frame_h)
+        self.dead_band = dead_band_frac * self.diag
+        self.meters_per_pixel = meters_per_pixel
+
+        self.state = "active"                 # 'active' | 'lost' | 'stopped'
+        self.elapsed_s = self.moving_s = self.still_s = 0.0
+        self.path_px = 0.0
+        self._start_c = self._last_c = None
+        self._skip_step = False
+        self.trail, self._trail_cap = [], 256
+
+        self.hm_w, self.hm_h = heatmap_size
+        self.heat = np.zeros((self.hm_h, self.hm_w), dtype=np.float32)
+        self.zone_dwell = defaultdict(float)
+        self.current_zone = None
+
+    def update(self, box, dt, zones):
+        self.state = "active"
+        c = centroid(box)
+        if self._start_c is None:
+            self._start_c = c
+        self.elapsed_s += dt
+
+        if self._last_c is not None and not self._skip_step:
+            step = math.hypot(c[0] - self._last_c[0], c[1] - self._last_c[1])
+            if step >= self.dead_band:
+                self.path_px += step
+                self.moving_s += dt
+            else:
+                self.still_s += dt
+        self._skip_step = False
+        self._last_c = c
+
+        self.trail.append(c)
+        if len(self.trail) > self._trail_cap:
+            self.trail = self.trail[-self._trail_cap:]
+
+        gx = min(self.hm_w - 1, max(0, int(c[0] / self.frame_w * self.hm_w)))
+        gy = min(self.hm_h - 1, max(0, int(c[1] / self.frame_h * self.hm_h)))
+        self.heat[gy, gx] += dt
+
+        cur, best = None, None
+        for z in zones:
+            x0, y0, x1, y1 = z["box"]
+            if x0 <= c[0] <= x1 and y0 <= c[1] <= y1:
+                area = (x1 - x0) * (y1 - y0)
+                if best is None or area < best:
+                    best, cur = area, z["label"]
+        self.current_zone = cur
+        if cur is not None:
+            self.zone_dwell[cur] += dt
+
+    def mark_lost(self):
+        self.state = "lost"
+        self._skip_step = True            # ignore the next step on re-acquire
+
+    def stop(self):
+        self.state = "stopped"
+
+    def net_px(self):
+        if self._start_c is None or self._last_c is None:
+            return 0.0
+        return math.hypot(self._last_c[0] - self._start_c[0],
+                          self._last_c[1] - self._start_c[1])
+
+    def summary(self):
+        d = {
+            "id": self.track_id, "label": self.label, "state": self.state,
+            "elapsed_s": round(self.elapsed_s, 1),
+            "moving_s": round(self.moving_s, 1), "still_s": round(self.still_s, 1),
+            "dist_px": round(self.path_px, 1),
+            "dist_frames": round(self.path_px / self.frame_w, 2),
+            "net_px": round(self.net_px(), 1),
+            "net_frames": round(self.net_px() / self.frame_w, 2),
+            "current_zone": self.current_zone,
+            "zones": [{"label": k, "dwell_s": round(v, 1)}
+                      for k, v in sorted(self.zone_dwell.items(),
+                                         key=lambda kv: kv[1], reverse=True)],
+        }
+        if self.meters_per_pixel:
+            d["dist_m"] = round(self.path_px * self.meters_per_pixel, 2)
+            d["net_m"] = round(self.net_px() * self.meters_per_pixel, 2)
+        return d
