@@ -23,6 +23,7 @@ import config
 from config import (DEFAULTS, DEFAULT_MODEL, DISPLAY_SIZE, MODELS,
                     SNAPSHOT_DIR)
 from labels import COCO_LABELS
+from reid import Roster
 from tracking import IoUTracker, TrackSession, ZoneRegistry, hit_test
 from trt_yolo import TRTYolo
 
@@ -274,6 +275,11 @@ class DetectionWorker:
         self.show_heatmap = True
         self.show_zones = True
 
+        # ---- cat re-identification (appearance) ----
+        self.roster = Roster(threshold=0.5)
+        self._pending_enroll = None     # None | {"name":str,"x":float,"y":float}
+        self._enrolling = None          # {"name","tid","left"} while averaging a signature
+
         SNAPSHOT_DIR.mkdir(exist_ok=True)
 
     # ---- lifecycle ----
@@ -380,8 +386,68 @@ class DetectionWorker:
         return self._track_snapshot      # atomically swapped reference; read-only
 
     # ---- worker-thread helpers (caller holds self._lock) ----
+    def enroll_cat(self, name, x, y):
+        with self._lock:
+            nm = str(name).strip()[:24] or "cat"
+            self._pending_enroll = {"name": nm, "x": float(x), "y": float(y)}
+        return {"queued": True}
+
+    def rename_cat(self, old, new):
+        nm = str(new).strip()[:24]
+        with self._lock:
+            self.roster.rename(str(old), nm)
+            if self._enrolling and self._enrolling["name"] == old:
+                self._enrolling["name"] = nm
+        return {"ok": True}
+
+    def clear_cat(self, name):
+        with self._lock:
+            self.roster.clear(str(name))
+            if self._enrolling and self._enrolling["name"] == name:
+                self._enrolling = None
+        return {"ok": True}
+
+    @staticmethod
+    def _hs_signature(frame, box):
+        """H-S color histogram of the box interior (center-cropped) -> L1-normed vector."""
+        h, w = frame.shape[:2]
+        x0, y0, x1, y1 = [int(v) for v in box]
+        mx, my = int((x1 - x0) * 0.2), int((y1 - y0) * 0.2)
+        cx0, cy0 = max(0, x0 + mx), max(0, y0 + my)
+        cx1, cy1 = min(w, x1 - mx), min(h, y1 - my)
+        if cx1 - cx0 < 3 or cy1 - cy0 < 3:
+            return None
+        hsv = cv2.cvtColor(frame[cy0:cy1, cx0:cx1], cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [12, 12], [0, 180, 0, 256])
+        hist = hist.flatten().astype(np.float32)
+        s = float(hist.sum())
+        return hist / s if s > 0 else None
+
+    def _reid_cats(self, frame, tracked):
+        """Name cat detections by matching appearance to the enrolled roster;
+        reinforce the signature during an active enrollment window."""
+        cats = [(i, self._hs_signature(frame, tracked[i]["box"]))
+                for i, d in enumerate(tracked) if d["name"] == "cat"]
+        cats = [(i, s) for i, s in cats if s is not None]
+        if self.roster.names() and cats:
+            assigned = self.roster.assign([s for _, s in cats])
+            for (i, _), name in zip(cats, assigned):
+                if name:
+                    tracked[i]["label"] = name
+                    tracked[i]["reid"] = name
+        if self._enrolling:
+            e = self._enrolling
+            t = self.tracker.get(e["tid"])
+            if t is not None and t.cls == "cat":
+                sig = self._hs_signature(frame, t.box)
+                if sig is not None:
+                    self.roster.reinforce(e["name"], sig)
+            e["left"] -= 1
+            if e["left"] <= 0:
+                self._enrolling = None
+
     def _reset_tracking(self):
-        """Scene changed (camera/rotation): drop session + zones."""
+        """Scene changed (camera/rotation): drop session + zones (keep the cat roster)."""
         self.tracker = IoUTracker()
         self.zones = ZoneRegistry()
         self._selected_id = None
@@ -390,9 +456,11 @@ class DetectionWorker:
         self._pending_select = None
         self._pending_stop = False
         self._pending_zone_ops = []
+        self._pending_enroll = None
+        self._enrolling = None
         self._track_snapshot = {"tracks": [], "track": None, "zones": []}
 
-    def _apply_pending(self, tracked):
+    def _apply_pending(self, tracked, frame):
         for op in self._pending_zone_ops:
             if op[0] == "add":
                 self.zones.add(op[1], op[2])
@@ -417,13 +485,26 @@ class DetectionWorker:
                 self._session = TrackSession(int(tid), t.label if t else f"#{tid}",
                                              self._fw, self._fh)
                 self._t_prev = None
+        if self._pending_enroll is not None:
+            req, self._pending_enroll = self._pending_enroll, None
+            tid = hit_test(tracked, req["x"], req["y"], self._fw, self._fh)
+            if tid is not None:
+                t = self.tracker.get(int(tid))
+                if t is not None and t.cls == "cat":
+                    sig = self._hs_signature(frame, t.box)
+                    if sig is not None:
+                        self.roster.enroll(req["name"], sig)
+                        self._enrolling = {"name": req["name"], "tid": int(tid),
+                                           "left": 12}
 
     def _build_snapshot(self, tracked):
         tracks = [{"id": d["id"], "label": d["label"], "cls": d["name"],
                    "score": round(d["score"], 2), "box": [int(v) for v in d["box"]],
                    "selected": d["id"] == self._selected_id} for d in tracked]
         summary = self._session.summary() if self._session is not None else None
-        return {"tracks": tracks, "track": summary, "zones": self.zones.list()}
+        return {"tracks": tracks, "track": summary, "zones": self.zones.list(),
+                "cats": self.roster.names(),
+                "enrolling": self._enrolling["name"] if self._enrolling else None}
 
     def config(self):
         return {
@@ -516,7 +597,8 @@ class DetectionWorker:
                     with self._lock:
                         tracked = self.tracker.update(dets)
                         self._last_tracks = tracked
-                        self._apply_pending(tracked)
+                        self._apply_pending(tracked, frame)
+                        self._reid_cats(frame, tracked)
                         self.zones.update_auto([d for d in tracked
                                                 if d["name"] in ZONE_CLASSES])
                         if (self._selected_id is not None and self._session is not None
