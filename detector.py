@@ -25,7 +25,7 @@ from config import (DEFAULTS, DEFAULT_MODEL, DISPLAY_SIZE, MODELS,
                     SNAPSHOT_DIR)
 from labels import COCO_LABELS
 from capture import should_capture, to_yolo_label
-from reid import Roster
+from reid import Roster, merge_identity
 from tracking import IoUTracker, TrackSession, ZoneRegistry, hit_test
 from trt_yolo import TRTYolo
 
@@ -300,6 +300,14 @@ class DetectionWorker:
         self._train_proc = None
         self._paused_for_train = False
 
+        # ---- identity model (fine-tuned on the named cats) ----
+        self.identity_enabled = True
+        self._identity_active = False
+        self._identity_names = []
+        self._identity_dirty = True       # load manifest on worker start
+        self._tid_names = {}              # track id -> sticky enrolled name
+        self._score_ema = {}              # track id -> smoothed display score
+
         SNAPSHOT_DIR.mkdir(exist_ok=True)
 
     # ---- lifecycle ----
@@ -318,7 +326,8 @@ class DetectionWorker:
     # ---- config API (called from the Flask thread) ----
     def set_config(self, max_detections=None, threshold=None, paused=None,
                    rotation=None, flip_h=None, flip_v=None,
-                   track_trail=None, track_heatmap=None, track_zones=None):
+                   track_trail=None, track_heatmap=None, track_zones=None,
+                   identity_enabled=None):
         with self._lock:
             if max_detections is not None:
                 self.max_detections = max(1, min(100, int(max_detections)))
@@ -341,6 +350,8 @@ class DetectionWorker:
                 self.show_heatmap = bool(track_heatmap)
             if track_zones is not None:
                 self.show_zones = bool(track_zones)
+            if identity_enabled is not None:
+                self.identity_enabled = bool(identity_enabled)
         return self.config()
 
     def request_model(self, model_key):
@@ -458,6 +469,32 @@ class DetectionWorker:
         self._paused_for_train = False
         return {"cancelled": True}
 
+    def _load_identity(self, current):
+        """Worker thread only: (re)load the trained identity engine from manifest."""
+        mf = os.path.join(self.dataset_dir, "identity", "manifest.json")
+        try:
+            with open(mf) as fh:
+                m = json.load(fh)
+            engine, names = m["engine"], [str(n) for n in (m.get("names") or [])]
+            if not os.path.exists(engine):
+                raise FileNotFoundError(engine)
+            if current is None:
+                current = TRTYolo(engine)
+            else:
+                current.reload(engine)
+            self._identity_active = True
+            self._identity_names = names
+            print(f"[detector] identity model active: {names} <- {engine}",
+                  file=sys.stderr)
+            return current, names
+        except FileNotFoundError:
+            pass                                        # not trained yet — normal
+        except Exception as e:
+            print(f"[detector] identity model load failed: {e}", file=sys.stderr)
+        self._identity_active = False
+        self._identity_names = []
+        return None, []
+
     def training_status(self):
         running = self._train_proc is not None and self._train_proc.poll() is None
         st = {}
@@ -494,9 +531,21 @@ class DetectionWorker:
         if self.roster.names() and cats:
             assigned = self.roster.assign([s for _, s in cats])
             for (i, _), name in zip(cats, assigned):
-                if name:
-                    tracked[i]["label"] = name
-                    tracked[i]["reid"] = name
+                if name:                     # claim the name for this track id
+                    tid = tracked[i]["id"]
+                    for t2 in [t2 for t2, n2 in self._tid_names.items()
+                               if n2 == name and t2 != tid]:
+                        del self._tid_names[t2]
+                    self._tid_names[tid] = name
+        # sticky: a named track KEEPS its name even on frames where the
+        # appearance match fails (kills the Dundun <-> "cat #N" flicker)
+        for i, _ in cats:
+            nm = self._tid_names.get(tracked[i]["id"])
+            if nm:
+                tracked[i]["label"] = nm
+                tracked[i]["reid"] = nm
+        self._tid_names = {t: n for t, n in self._tid_names.items()
+                           if t in self.tracker.tracks}
         if self._enrolling:
             e = self._enrolling
             t = self.tracker.get(e["tid"])
@@ -588,7 +637,8 @@ class DetectionWorker:
 
     def _build_snapshot(self, tracked):
         tracks = [{"id": d["id"], "label": d["label"], "cls": d["name"],
-                   "score": round(d["score"], 2), "box": [int(v) for v in d["box"]],
+                   "score": round(d.get("disp", d["score"]), 2),
+                   "box": [int(v) for v in d["box"]],
                    "selected": d["id"] == self._selected_id} for d in tracked]
         summary = self._session.summary() if self._session is not None else None
         return {"tracks": tracks, "track": summary, "zones": self.zones.list(),
@@ -614,6 +664,9 @@ class DetectionWorker:
             "track_trail": self.show_trail,
             "track_heatmap": self.show_heatmap,
             "track_zones": self.show_zones,
+            "identity_enabled": self.identity_enabled,
+            "identity_active": self._identity_active,
+            "identity_names": list(self._identity_names),
         }
 
     def fps(self):
@@ -641,6 +694,7 @@ class DetectionWorker:
     # ---- worker thread ----
     def _run(self):
         model = TRTYolo(MODELS[self.model_key])    # GPU engine: load once
+        identity, id_names = None, []              # fine-tuned cat model (optional)
         while self._running:                       # camera: reconnect on error
             source = None
             try:
@@ -666,9 +720,14 @@ class DetectionWorker:
                         p = self._train_proc
                         if p is None or p.poll() is not None:
                             self._paused_for_train = False   # trainer finished -> resume
+                            self._identity_dirty = True      # pick up the new engine
                         else:
                             time.sleep(0.3)
                             continue
+
+                    if self._identity_dirty:
+                        self._identity_dirty = False
+                        identity, id_names = self._load_identity(identity)
 
                     frame = source.read()
                     if frame is None:
@@ -684,9 +743,14 @@ class DetectionWorker:
 
                     t0 = time.perf_counter()
                     raw = model.infer(frame, conf=self.threshold)
-                    self.infer_ms = (time.perf_counter() - t0) * 1000.0
-
                     dets = self._to_dets(raw)
+                    if identity is not None and self.identity_enabled and id_names:
+                        id_raw = identity.infer(frame, conf=0.50)
+                        id_dets = [{"name": id_names[c] if c < len(id_names) else str(c),
+                                    "score": float(s), "box": b}
+                                   for c, s, b in id_raw]
+                        dets = merge_identity(dets, id_dets)
+                    self.infer_ms = (time.perf_counter() - t0) * 1000.0
                     self._fh, self._fw = frame.shape[0], frame.shape[1]
                     now = time.perf_counter()
                     dt = (now - self._t_prev) if self._t_prev else 0.0
@@ -694,6 +758,17 @@ class DetectionWorker:
 
                     with self._lock:
                         tracked = self.tracker.update(dets)
+                        idset = set(id_names)
+                        for d in tracked:
+                            if d["name"] in idset:       # trained classes: plain name
+                                d["label"] = d["name"]
+                                d["reid"] = d["name"]
+                            e = self._score_ema.get(d["id"], d["score"])
+                            e = 0.7 * e + 0.3 * d["score"]
+                            self._score_ema[d["id"]] = e
+                            d["disp"] = round(e, 2)      # smoothed display confidence
+                        self._score_ema = {t: v for t, v in self._score_ema.items()
+                                           if t in self.tracker.tracks}
                         self._last_tracks = tracked
                         self._apply_pending(tracked, frame)
                         self._reid_cats(frame, tracked)
@@ -774,7 +849,7 @@ class DetectionWorker:
             is_sel = d.get("id") == sel
             color = cyan if is_sel else _color_for(d["name"])
             cv2.rectangle(out, (x0, y0), (x1, y1), color, 3 if is_sel else 2)
-            label = f'{d.get("label", d["name"])} {d["score"] * 100:.0f}%'
+            label = f'{d.get("label", d["name"])} {d.get("disp", d["score"]) * 100:.0f}%'
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2.rectangle(out, (x0, max(0, y0 - th - 6)), (x0 + tw + 4, y0), color, -1)
             cv2.putText(out, label, (x0 + 2, max(10, y0 - 4)),

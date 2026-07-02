@@ -82,6 +82,7 @@ def set_config():
         track_trail=data.get("track_trail"),
         track_heatmap=data.get("track_heatmap"),
         track_zones=data.get("track_zones"),
+        identity_enabled=data.get("identity_enabled"),
     )
     return jsonify(cfg)
 

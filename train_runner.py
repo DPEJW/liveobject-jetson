@@ -1,23 +1,30 @@
 """On-Orin fine-tune runner (executed by the TRAINING venv, not the live service).
 
 Launched as a subprocess by detector.py:
-    ~/venvs/train/bin/python train_runner.py <epochs>
+    ~/venvs/train/bin/python train_runner.py <epochs>    # train + export + engine
+    ~/venvs/train/bin/python train_runner.py export      # export newest best.pt only
 
 Reads the captured dataset in ~/catdata (images/ + labels/ + classes.json), makes
 an 80/20 train/val split (symlinks), writes data.yaml, and fine-tunes a small model
-on ONLY the manually-labeled classes. Per-epoch progress (epoch / loss / mAP) is
-written to ~/catdata/train_status.json for the dashboard to poll.
+on ONLY the manually-labeled classes. After training it exports best.pt -> ONNX ->
+TensorRT engine (trtexec --fp16) and writes ~/catdata/identity/manifest.json, which
+the live detector loads as the "identity model" running alongside the base model.
+Progress (epoch / loss / mAP, then exporting/building states) is written to
+~/catdata/train_status.json for the dashboard to poll.
 """
 import glob
 import json
 import os
 import random
 import shutil
+import subprocess
 import sys
 import time
 
 DATA = os.path.expanduser("~/catdata")
 STATUS = os.path.join(DATA, "train_status.json")
+IDENT = os.path.join(DATA, "identity")
+TRTEXEC = "/usr/src/tensorrt/bin/trtexec"
 
 
 def write_status(**kw):
@@ -28,17 +35,67 @@ def write_status(**kw):
     os.replace(tmp, STATUS)   # atomic
 
 
-def main():
-    epochs = int(sys.argv[1]) if len(sys.argv) > 1 else 30
-    imgsz = 320
-    try:
-        class_map = json.load(open(os.path.join(DATA, "classes.json")))
-    except Exception:
-        write_status(state="error", msg="nothing labeled yet (no classes.json)")
-        return
+def load_names():
+    class_map = json.load(open(os.path.join(DATA, "classes.json")))
     names = [None] * len(class_map)
     for n, i in class_map.items():
         names[int(i)] = n
+    return names
+
+
+def export_deploy(best, names):
+    """best.pt -> ONNX -> TensorRT engine + manifest.json. Returns engine path."""
+    write_status(state="exporting", names=names, msg="best.pt -> ONNX")
+    from ultralytics import YOLO
+    onnx_path = YOLO(best).export(format="onnx", imgsz=640, opset=12,
+                                  simplify=False, device="cpu")
+    os.makedirs(IDENT, exist_ok=True)
+    engine = os.path.join(IDENT, "identity_%s.engine" % time.strftime("%Y%m%d_%H%M%S"))
+    write_status(state="building", names=names,
+                 msg="TensorRT engine build (takes a few minutes)")
+    r = subprocess.run([TRTEXEC, "--onnx=%s" % onnx_path, "--saveEngine=%s" % engine,
+                        "--fp16"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       timeout=2400)
+    if r.returncode != 0 or not os.path.exists(engine):
+        tail = r.stdout.decode(errors="replace")[-400:]
+        write_status(state="error", msg="trtexec failed: " + tail)
+        return None
+    manifest = {"engine": engine, "names": names, "built": time.time(), "best": best}
+    tmp = os.path.join(IDENT, "manifest.json.tmp")
+    with open(tmp, "w") as fh:
+        json.dump(manifest, fh)
+    os.replace(tmp, os.path.join(IDENT, "manifest.json"))
+    return engine
+
+
+def newest_best():
+    cands = glob.glob(os.path.join(DATA, "train_out", "*", "weights", "best.pt"))
+    return max(cands, key=os.path.getmtime) if cands else None
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "export":
+        try:
+            names = load_names()
+        except Exception:
+            write_status(state="error", msg="no classes.json")
+            return
+        best = newest_best()
+        if not best:
+            write_status(state="error", msg="no trained best.pt to export")
+            return
+        engine = export_deploy(best, names)
+        if engine:
+            write_status(state="done", names=names, best=best, engine=engine)
+        return
+
+    epochs = int(sys.argv[1]) if len(sys.argv) > 1 else 30
+    imgsz = 320
+    try:
+        names = load_names()
+    except Exception:
+        write_status(state="error", msg="nothing labeled yet (no classes.json)")
+        return
 
     imgs = sorted(glob.glob(os.path.join(DATA, "images", "*.jpg")))
     if len(imgs) < 8:
@@ -91,9 +148,14 @@ def main():
         model.train(data=data_yaml, epochs=epochs, imgsz=imgsz, batch=8, device=0,
                     workers=2, project=os.path.join(DATA, "train_out"), name="model",
                     exist_ok=True, plots=False, verbose=False)
-        cands = glob.glob(os.path.join(DATA, "train_out", "*", "weights", "best.pt"))
-        best = max(cands, key=os.path.getmtime) if cands else None
-        write_status(state="done", epoch=epochs, epochs=epochs, names=names, best=best)
+        best = newest_best()
+        if not best:
+            write_status(state="error", msg="training finished but no best.pt found")
+            return
+        engine = export_deploy(best, names)   # ONNX -> TensorRT -> manifest
+        if engine:
+            write_status(state="done", epoch=epochs, epochs=epochs, names=names,
+                         best=best, engine=engine)
     except Exception as exc:
         write_status(state="error", msg=str(exc)[:300])
 
