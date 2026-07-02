@@ -331,3 +331,9 @@ input[type=range]::-moz-range-thumb {
 .cats-list .nm { letter-spacing: .5px; }
 .cats-list .x { margin-left: auto; background: none; border: 0; color: var(--ink-dim); cursor: pointer; }
 .cats-list .x:hover { color: var(--red); }
+
+/* ---- training progress ---- */
+.train-prog { margin-top: 8px; }
+.tp-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; margin-bottom: 8px; }
+.tp-row .ro-k { color: var(--ink-dim); }
+#train-btn:disabled { opacity: .4; cursor: default; }

@@ -82,6 +82,24 @@
       </div>
 
       <div class="card" data-reveal="2">
+        <h2>Training <span id="train-state" class="tag">idle</span></h2>
+        <ul id="ds-counts" class="cats-list"><li class="muted">no samples yet</li></ul>
+        <div class="btn-row">
+          <button id="train-btn" class="btn">TRAIN</button>
+          <button id="train-cancel" class="btn ghost hidden">CANCEL</button>
+        </div>
+        <div id="train-prog" class="train-prog hidden">
+          <div class="tp-row">
+            <span class="ro-k">EPOCH</span><b id="tp-epoch">0/0</b>
+            <span class="ro-k">LOSS</span><b id="tp-loss">—</b>
+            <span class="ro-k">mAP50</span><b id="tp-map" class="alt">—</b>
+          </div>
+          <div class="meter"><i id="tp-bar"></i></div>
+          <div class="chart-box"><canvas id="mapChart"></canvas></div>
+        </div>
+      </div>
+
+      <div class="card" data-reveal="2">
         <h2>Camera</h2>
         <label class="ctl">
           <span>Source</span>

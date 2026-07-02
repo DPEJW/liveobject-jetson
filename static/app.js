@@ -141,6 +141,55 @@ wireToggle("tg-trail", "track_trail");
 wireToggle("tg-heatmap", "track_heatmap");
 wireToggle("tg-zones", "track_zones");
 
+// ---- training progress ----
+const mapChart = new Chart($("mapChart"), {
+  type: "line",
+  data: { labels: [], datasets: [{ label: "mAP50", data: [], borderColor: "#4fd6c6",
+          backgroundColor: "#4fd6c61f", borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill: true }] },
+  options: { animation: false, responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { display: false },
+               title: { display: true, text: "mAP50 vs epoch", color: "#687a89", align: "start",
+                        font: { family: "'IBM Plex Mono', monospace", size: 10 } } },
+    scales: { x: { display: false },
+              y: { beginAtZero: true, suggestedMax: 1, ticks: { color: "#455463", maxTicksLimit: 4, font: { size: 9 } },
+                   grid: { color: "rgba(110,150,175,.08)" }, border: { display: false } } } },
+});
+let trainLastEpoch = -1;
+$("train-btn").addEventListener("click", () =>
+  fetch("/train", { method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ action: "start" }) }));
+$("train-cancel").addEventListener("click", () =>
+  fetch("/train", { method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ action: "cancel" }) }));
+
+function trainPoll() {
+  fetch("/train/status").then((r) => r.json()).then((t) => {
+    const st = t.state || "idle";
+    $("train-state").textContent = t.running ? (st === "starting" ? "starting" : "training") : st;
+    $("train-prog").classList.toggle("hidden", !(t.running || st === "training" || st === "starting" || st === "done" || st === "error"));
+    $("train-cancel").classList.toggle("hidden", !t.running);
+    $("train-btn").disabled = !!t.running;
+    if (st === "error") {
+      $("tp-epoch").textContent = "—";
+      $("tp-map").textContent = String(t.msg || t.err || "error").slice(0, 40);
+      return;
+    }
+    const ep = t.epoch || 0, eps = t.epochs || 0;
+    $("tp-epoch").textContent = ep + "/" + eps;
+    $("tp-loss").textContent = (t.loss != null ? t.loss : "—");
+    $("tp-map").textContent = (t.mAP50 != null ? t.mAP50 : "—");
+    $("tp-bar").style.width = (eps ? Math.min(100, 100 * ep / eps) : 0) + "%";
+    if (st === "starting" || ep < trainLastEpoch) {
+      mapChart.data.labels = []; mapChart.data.datasets[0].data = []; trainLastEpoch = -1;
+    }
+    if (t.mAP50 != null && ep > trainLastEpoch && ep > 0) {
+      mapChart.data.labels.push(ep); mapChart.data.datasets[0].data.push(t.mAP50);
+      mapChart.update("none"); trainLastEpoch = ep;
+    }
+  }).catch(() => {});
+}
+setInterval(trainPoll, 1000); trainPoll();
+
 $("rotate").addEventListener("click", () => {
   const cur = +($("rotate").dataset.rot || 0);
   postConfig({ rotation: (cur + 90) % 360 });
@@ -274,6 +323,13 @@ function poll() {
     } else if (!enrollMode) {
       $("enroll-hint").classList.add("hidden");
     }
+
+    const ds = s.dataset || {};
+    const dsKeys = Object.keys(ds);
+    $("ds-counts").innerHTML = dsKeys.length
+      ? dsKeys.map((n) => `<li><span class="swatch" style="background:${colorFor(n)}"></span>`
+          + `<span class="nm">${n}</span><span class="sc">${ds[n]} frames</span></li>`).join("")
+      : '<li class="muted">no samples yet — name a cat & keep it in view</li>';
 
     const tracks = s.tracks || [];
     $("trk-list").innerHTML = tracks.length
