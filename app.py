@@ -142,5 +142,21 @@ def enroll():
     return jsonify({"error": "bad enroll request"}), 400
 
 
+@app.route("/train", methods=["POST"])
+def train():
+    data = request.get_json(force=True, silent=True) or {}
+    action = data.get("action")
+    if action == "start":
+        return jsonify(worker.start_training(int(data.get("epochs", 30))))
+    if action == "cancel":
+        return jsonify(worker.cancel_training())
+    return jsonify({"error": "unknown action"}), 400
+
+
+@app.route("/train/status")
+def train_status():
+    return jsonify(worker.training_status())
+
+
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)

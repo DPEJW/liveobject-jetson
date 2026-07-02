@@ -296,6 +296,10 @@ class DetectionWorker:
         self._roster_path = os.path.join(self.dataset_dir, "roster.json")
         self.roster.load(self._roster_path)   # survive restarts
 
+        # ---- on-Orin training job ----
+        self._train_proc = None
+        self._paused_for_train = False
+
         SNAPSHOT_DIR.mkdir(exist_ok=True)
 
     # ---- lifecycle ----
@@ -424,6 +428,45 @@ class DetectionWorker:
                 self._enrolling = None
             self.roster.save(self._roster_path)
         return {"ok": True}
+
+    # ---- training control ----
+    def _launch_train(self, epochs):
+        import subprocess
+        vpy = os.path.expanduser("~/venvs/train/bin/python")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_runner.py")
+        ob = os.path.expanduser("~/oblas/root/usr/lib/aarch64-linux-gnu")
+        env = dict(os.environ)
+        env["LD_LIBRARY_PATH"] = f"{ob}/openblas-pthread:{ob}:" + env.get("LD_LIBRARY_PATH", "")
+        log = open(os.path.join(self.dataset_dir, "train.log"), "w")
+        return subprocess.Popen([vpy, script, str(int(epochs))], cwd=self.dataset_dir,
+                                stdout=log, stderr=subprocess.STDOUT, env=env)
+
+    def start_training(self, epochs=30):
+        with self._lock:
+            if self._train_proc is not None and self._train_proc.poll() is None:
+                return {"error": "already training"}
+            self._paused_for_train = True          # frees the GPU for the trainer
+            self._train_proc = self._launch_train(epochs)
+        return {"started": True, "epochs": int(epochs)}
+
+    def cancel_training(self):
+        with self._lock:
+            p = self._train_proc
+        if p is not None and p.poll() is None:
+            p.terminate()
+        self._paused_for_train = False
+        return {"cancelled": True}
+
+    def training_status(self):
+        running = self._train_proc is not None and self._train_proc.poll() is None
+        st = {}
+        try:
+            with open(os.path.join(self.dataset_dir, "train_status.json")) as fh:
+                st = json.load(fh)
+        except (OSError, ValueError):
+            pass
+        st["running"] = running
+        return st
 
     @staticmethod
     def _hs_signature(frame, box):
@@ -617,6 +660,14 @@ class DetectionWorker:
                     if self.paused:
                         time.sleep(0.05)
                         continue
+
+                    if self._paused_for_train:
+                        p = self._train_proc
+                        if p is None or p.poll() is not None:
+                            self._paused_for_train = False   # trainer finished -> resume
+                        else:
+                            time.sleep(0.3)
+                            continue
 
                     frame = source.read()
                     if frame is None:
