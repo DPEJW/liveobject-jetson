@@ -293,6 +293,8 @@ class DetectionWorker:
         self._class_map = {}            # name -> class idx (stable)
         self._dataset_counts = {}       # name -> labeled instances saved
         self._last_capture_ts = None
+        self._roster_path = os.path.join(self.dataset_dir, "roster.json")
+        self.roster.load(self._roster_path)   # survive restarts
 
         SNAPSHOT_DIR.mkdir(exist_ok=True)
 
@@ -412,6 +414,7 @@ class DetectionWorker:
             self.roster.rename(str(old), nm)
             if self._enrolling and self._enrolling["name"] == old:
                 self._enrolling["name"] = nm
+            self.roster.save(self._roster_path)
         return {"ok": True}
 
     def clear_cat(self, name):
@@ -419,6 +422,7 @@ class DetectionWorker:
             self.roster.clear(str(name))
             if self._enrolling and self._enrolling["name"] == name:
                 self._enrolling = None
+            self.roster.save(self._roster_path)
         return {"ok": True}
 
     @staticmethod
@@ -459,6 +463,7 @@ class DetectionWorker:
             e["left"] -= 1
             if e["left"] <= 0:
                 self._enrolling = None
+                self.roster.save(self._roster_path)
 
     def _maybe_capture(self, frame, tracked, now):
         """Save a labeled frame when a NAMED cat is confidently detected. Only
@@ -533,6 +538,7 @@ class DetectionWorker:
                     sig = self._hs_signature(frame, t.box)
                     if sig is not None:
                         self.roster.enroll(req["name"], sig)
+                        self.roster.save(self._roster_path)
                         self._enrolling = {"name": req["name"], "tid": int(tid),
                                            "left": 12}
 

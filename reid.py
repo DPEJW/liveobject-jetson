@@ -9,6 +9,9 @@ A signature is an L1-normalized histogram (1-D here / flattened H-S in practice)
 """
 from __future__ import annotations
 
+import json
+import os
+
 import numpy as np
 
 
@@ -60,6 +63,22 @@ class Roster:
 
     def names(self):
         return list(self.sigs.keys())
+
+    def save(self, path):
+        try:
+            with open(path, "w") as fh:
+                json.dump({n: s.tolist() for n, s in self.sigs.items()}, fh)
+        except OSError:
+            pass
+
+    def load(self, path):
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return
+        for n, s in data.items():
+            self.enroll(n, np.asarray(s, dtype=np.float32))
 
     def match(self, sig):
         """Best (name, score); name is None if the best score is below threshold."""
