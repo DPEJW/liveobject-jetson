@@ -53,9 +53,11 @@ def export_deploy(best, names):
     engine = os.path.join(IDENT, "identity_%s.engine" % time.strftime("%Y%m%d_%H%M%S"))
     write_status(state="building", names=names,
                  msg="TensorRT engine build (takes a few minutes)")
+    env = dict(os.environ)
+    env.pop("CUDA_VISIBLE_DEVICES", None)   # ultralytics cpu-export sets it to "" —
     r = subprocess.run([TRTEXEC, "--onnx=%s" % onnx_path, "--saveEngine=%s" % engine,
                         "--fp16"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                       timeout=2400)
+                       timeout=2400, env=env)
     if r.returncode != 0 or not os.path.exists(engine):
         tail = r.stdout.decode(errors="replace")[-400:]
         write_status(state="error", msg="trtexec failed: " + tail)
