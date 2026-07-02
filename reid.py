@@ -14,6 +14,23 @@ import os
 
 import numpy as np
 
+from tracking import iou
+
+
+def merge_identity(base_dets, identity_dets, iou_thresh=0.45):
+    """Merge identity-model detections (named cats, e.g. 'Dundun') into the base
+    COCO detections: an identity det REPLACES any overlapping generic 'cat' det
+    (the fine-tuned confidence wins); non-overlapping identity dets are appended
+    (the identity model found a cat the base model missed). Non-cat classes
+    (couch, zones, …) are never touched."""
+    out = list(base_dets)
+    for idd in identity_dets:
+        for d in [d for d in out
+                  if d["name"] == "cat" and iou(d["box"], idd["box"]) >= iou_thresh]:
+            out.remove(d)
+        out.append(idd)
+    return out
+
 
 def _norm(v):
     v = np.asarray(v, dtype=np.float32)

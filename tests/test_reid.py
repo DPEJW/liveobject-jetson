@@ -9,7 +9,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
-from reid import similarity, Roster
+from reid import similarity, Roster, merge_identity
 
 
 def _sig(peak, n=32):
@@ -51,6 +51,33 @@ def test_returning_cat_regains_name():
     r = Roster(threshold=0.5)
     r.enroll("Mittens", _sig(3))
     assert r.match(_sig(3))[0] == "Mittens"     # left view and came back
+
+
+def test_merge_identity_replaces_overlapping_cat():
+    base = [{"name": "cat", "score": 0.55, "box": [100, 100, 200, 200]},
+            {"name": "couch", "score": 0.9, "box": [50, 50, 400, 300]}]
+    ident = [{"name": "Dundun", "score": 0.86, "box": [105, 102, 205, 198]}]
+    out = merge_identity(base, ident)
+    names = sorted(d["name"] for d in out)
+    assert names == ["Dundun", "couch"], names           # cat replaced, couch kept
+    d = next(d for d in out if d["name"] == "Dundun")
+    assert d["score"] == 0.86
+
+
+def test_merge_identity_keeps_non_overlapping_cat_and_appends_new():
+    base = [{"name": "cat", "score": 0.6, "box": [800, 500, 900, 600]}]
+    ident = [{"name": "Dundun", "score": 0.9, "box": [100, 100, 200, 200]}]
+    out = merge_identity(base, ident)
+    names = sorted(d["name"] for d in out)
+    assert names == ["Dundun", "cat"], names             # both survive (different spots)
+
+
+def test_merge_identity_never_touches_non_cat_classes():
+    base = [{"name": "dog", "score": 0.7, "box": [100, 100, 200, 200]}]
+    ident = [{"name": "Dundun", "score": 0.9, "box": [100, 100, 200, 200]}]
+    out = merge_identity(base, ident)
+    names = sorted(d["name"] for d in out)
+    assert names == ["Dundun", "dog"], names
 
 
 def test_enroll_averages_multiple_samples():
