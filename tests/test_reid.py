@@ -105,3 +105,44 @@ if __name__ == "__main__":
             traceback.print_exc()
     print(f"\n{len(funcs) - failed}/{len(funcs)} passed")
     sys.exit(1 if failed else 0)
+
+
+def test_class_gated_match_person_vs_cat():
+    r = Roster(threshold=0.5)
+    r.enroll("Dundun", _sig(3), cls="cat")
+    r.enroll("Jiawei", _sig(3), cls="person")   # same look, different class
+    assert r.match(_sig(3), cls="person")[0] == "Jiawei"
+    assert r.match(_sig(3), cls="cat")[0] == "Dundun"
+
+
+def test_class_gated_assign():
+    r = Roster(threshold=0.3)
+    r.enroll("Dundun", _sig(3), cls="cat")
+    r.enroll("Jiawei", _sig(20), cls="person")
+    got = r.assign([_sig(20), _sig(3)], clses=["person", "cat"])
+    assert got == ["Jiawei", "Dundun"], got
+    # a person-looking sig on a cat det must NOT be named Jiawei
+    got = r.assign([_sig(20)], clses=["cat"])
+    assert got == [None], got
+
+
+def test_roster_v2_roundtrip_keeps_classes(tmp_path=None):
+    import tempfile
+    r = Roster(threshold=0.5)
+    r.enroll("Jiawei", _sig(5), cls="person")
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "roster.json")
+        r.save(p)
+        r2 = Roster(threshold=0.5)
+        r2.load(p)
+        assert r2.base_cls("Jiawei") == "person"
+        assert r2.match(_sig(5), cls="person")[0] == "Jiawei"
+
+
+def test_merge_identity_uses_base_class_map():
+    base = [{"name": "person", "score": 0.6, "box": [100, 100, 200, 200]},
+            {"name": "cat", "score": 0.6, "box": [100, 100, 200, 200]}]
+    ident = [{"name": "Jiawei", "score": 0.9, "box": [102, 101, 199, 202]}]
+    out = merge_identity(base, ident, base_cls={"Jiawei": "person"})
+    names = sorted(d["name"] for d in out)
+    assert names == ["Jiawei", "cat"], names   # person replaced, cat untouched

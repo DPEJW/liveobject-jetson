@@ -109,6 +109,10 @@ class TRTYolo:
 
         if inp is None or out is None:
             raise RuntimeError("engine must expose one input and one output tensor")
+        # The engine knows its true input resolution — trust it over the ctor
+        # default so 960/1280 high-res engines letterbox correctly.
+        if len(inp.shape) == 4 and inp.shape[-1] > 0:
+            self.input_size = int(inp.shape[-1])
         # Swap in the new engine/context/buffers only once everything is wired.
         self.engine, self.context, self.inp, self.out = engine, context, inp, out
 

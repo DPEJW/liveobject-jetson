@@ -135,12 +135,27 @@ def enroll():
     data = request.get_json(force=True, silent=True) or {}
     action = data.get("action", "enroll")
     if action == "enroll" and data.get("name") and data.get("x") is not None:
-        return jsonify(worker.enroll_cat(data["name"], data["x"], data["y"]))
+        return jsonify(worker.enroll_object(data["name"], data["x"], data["y"]))
     if action == "rename" and data.get("old") and data.get("new"):
-        return jsonify(worker.rename_cat(data["old"], data["new"]))
+        return jsonify(worker.rename_object(data["old"], data["new"]))
     if action == "clear" and data.get("name"):
-        return jsonify(worker.clear_cat(data["name"]))
+        return jsonify(worker.clear_object(data["name"]))
     return jsonify({"error": "bad enroll request"}), 400
+
+
+@app.route("/feedback", methods=["POST"])
+def feedback():
+    """Manual verdicts on live detections: flag ✓ good / ✗ bad (retrains the
+    custom model on named objects; suppresses noisy generic classes), and
+    unsuppress to bring a hidden class back."""
+    data = request.get_json(force=True, silent=True) or {}
+    action = data.get("action", "flag")
+    if action == "flag" and data.get("id") is not None:
+        return jsonify(worker.flag_detection(data["id"],
+                                             data.get("verdict", "")))
+    if action == "unsuppress" and data.get("name"):
+        return jsonify(worker.unsuppress(data["name"]))
+    return jsonify({"error": "bad feedback request"}), 400
 
 
 @app.route("/train", methods=["POST"])

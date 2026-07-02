@@ -63,7 +63,19 @@ yolo26m ~110 fps), vs ~12 fps on the Orin NX.
 ## Features
 
 - **Live annotated video** — MJPEG stream with boxes + class + confidence.
-- **Detections panel** — live list of detected objects and scores.
+- **Detections panel** — live list of detected objects and scores, each row with
+  **✓ / ✗ feedback buttons**: ✓ on a named object force-saves a training sample;
+  ✗ on a named object saves a hard-negative frame (that region is *not* that
+  name) and un-sticks the wrong name; ✗ on a generic COCO class hides that class
+  (reversible chips under the panel — the frozen base model can't be retrained,
+  so suppression is the honest fix for its false positives).
+- **Name any object** (was cats-only) — click *+ NAME OBJECT*, then click any
+  detection (person, cat, dog, …) and give it a name. Appearance re-ID keeps
+  naming it live; each identity remembers its base class, so a person's
+  signature is never matched against a cat. Auto-capture collects labeled
+  frames whenever a named object is confidently seen; **TRAIN** fine-tunes the
+  custom model on every named identity and hot-swaps it into the live pipeline
+  when done (named detections then replace the generic ones of that class).
 - **Backend controls** (all live, no restart): max detections, confidence
   threshold, **model switch** (`yolo26m` ⇄ `yolo26l` ⇄ `yolo11m`), snapshot,
   pause / resume, rotation (0/90/180/270) and horizontal / vertical flip.

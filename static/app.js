@@ -104,7 +104,7 @@ let enrollMode = false;
 function setEnrollMode(on) {
   enrollMode = on;
   $("enroll-btn").classList.toggle("on", on);
-  $("enroll-hint").textContent = "click a cat on the video…";
+  $("enroll-hint").textContent = "click any object on the video…";
   $("enroll-hint").classList.toggle("hidden", !on);
 }
 $("enroll-btn").addEventListener("click", () => setEnrollMode(!enrollMode));
@@ -117,7 +117,7 @@ $("stream").addEventListener("click", (e) => {
   const r = e.currentTarget.getBoundingClientRect();
   const nx = (e.clientX - r.left) / r.width, ny = (e.clientY - r.top) / r.height;
   if (enrollMode) {
-    const name = (prompt("Name this cat:") || "").trim();
+    const name = (prompt("Name this object:") || "").trim();
     if (name) fetch("/enroll", { method: "POST", headers: { "Content-Type": "application/json" },
                                  body: JSON.stringify({ action: "enroll", name, x: nx, y: ny }) });
     setEnrollMode(false);
@@ -254,7 +254,7 @@ function tick() {
 }
 setInterval(tick, 1000); tick();
 
-// ---- detections ----
+// ---- detections (with ✓/✗ feedback buttons) ----
 function renderDetections(dets) {
   const list = $("det-list");
   if (!dets.length) { list.innerHTML = '<li class="muted">no objects detected</li>'; return; }
@@ -262,10 +262,24 @@ function renderDetections(dets) {
     a.name < b.name ? -1 : a.name > b.name ? 1 : b.score - a.score);
   list.innerHTML = dets.map((d) =>
     `<li><span class="swatch" style="background:${colorFor(d.name)}"></span>` +
-    `<span class="nm">${d.name}</span>` +
-    `<span class="sc">${(d.score * 100).toFixed(0)}%</span></li>`
+    `<span class="nm">${d.label || d.name}</span>` +
+    `<span class="sc">${(d.score * 100).toFixed(0)}%</span>` +
+    `<button class="fb good" data-id="${d.id}" data-fb="good" title="correct — save as training sample">✓</button>` +
+    `<button class="fb bad" data-id="${d.id}" data-fb="bad" title="wrong — hard negative / hide class">✗</button></li>`
   ).join("");
 }
+$("det-list").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-fb]");
+  if (b) fetch("/feedback", { method: "POST", headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ action: "flag", id: +b.dataset.id,
+                                                     verdict: b.dataset.fb }) });
+});
+$("suppressed-list").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-unsup]");
+  if (b) fetch("/feedback", { method: "POST", headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ action: "unsuppress",
+                                                     name: b.dataset.unsup }) });
+});
 
 // ---- one-time config hydration ----
 function applyConfigOnce(cfg) {
@@ -324,12 +338,13 @@ function poll() {
     $("det-count").textContent = s.count;
     renderDetections(s.detections);
 
-    // ---- cats + tracking ----
-    const cats = s.cats || [];
-    $("cats-list").innerHTML = cats.map((n) =>
-      `<li><span class="swatch" style="background:${colorFor(n)}"></span>`
-      + `<span class="nm">${n}</span>`
-      + `<button class="x" data-clear="${n}" title="forget">✕</button></li>`).join("");
+    // ---- named identities + tracking ----
+    const ids = s.identities || (s.cats || []).map((n) => ({ name: n, cls: "cat" }));
+    $("cats-list").innerHTML = ids.map((i) =>
+      `<li><span class="swatch" style="background:${colorFor(i.name)}"></span>`
+      + `<span class="nm">${i.name}</span>`
+      + (i.cls ? `<span class="cls-tag">${i.cls}</span>` : "")
+      + `<button class="x" data-clear="${i.name}" title="forget">✕</button></li>`).join("");
     if (s.enrolling) {
       $("enroll-hint").textContent = "learning " + s.enrolling + "…";
       $("enroll-hint").classList.remove("hidden");
@@ -337,12 +352,20 @@ function poll() {
       $("enroll-hint").classList.add("hidden");
     }
 
+    const sup = s.suppressed || [];
+    $("suppressed-row").classList.toggle("hidden", !sup.length);
+    $("suppressed-list").innerHTML = sup.map((n) =>
+      `<button class="chip" data-unsup="${n}" title="click to show again">${n} ✕</button>`).join(" ");
+
     const ds = s.dataset || {};
     const dsKeys = Object.keys(ds);
+    const fb = s.feedback || {};
+    const fbNote = (fb.good || fb.bad)
+      ? `<li class="muted">feedback: ${fb.good || 0} ✓ · ${fb.bad || 0} ✗</li>` : "";
     $("ds-counts").innerHTML = dsKeys.length
       ? dsKeys.map((n) => `<li><span class="swatch" style="background:${colorFor(n)}"></span>`
-          + `<span class="nm">${n}</span><span class="sc">${ds[n]} frames</span></li>`).join("")
-      : '<li class="muted">no samples yet — name a cat & keep it in view</li>';
+          + `<span class="nm">${n}</span><span class="sc">${ds[n]} frames</span></li>`).join("") + fbNote
+      : '<li class="muted">no samples yet — name an object & keep it in view</li>';
 
     const tracks = (s.tracks || []).slice().sort((a, b) => a.id - b.id);  // stable rows
     $("trk-list").innerHTML = tracks.length

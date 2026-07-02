@@ -59,8 +59,8 @@
       <div class="card" data-reveal="1">
         <h2>Tracking <span id="trk-state" class="tag">idle</span></h2>
         <div class="cats-row">
-          <button id="enroll-btn" class="btn ghost">+ NAME A CAT</button>
-          <span id="enroll-hint" class="enroll-hint hidden">click a cat on the video…</span>
+          <button id="enroll-btn" class="btn ghost">+ NAME OBJECT</button>
+          <span id="enroll-hint" class="enroll-hint hidden">click any object on the video…</span>
         </div>
         <ul id="cats-list" class="cats-list"></ul>
         <ul id="trk-list" class="trk-list"><li class="muted">no objects yet</li></ul>
@@ -170,6 +170,10 @@
       <div class="card" data-reveal="4">
         <h2>Detections <span id="det-count" class="tag">0</span></h2>
         <ul id="det-list" class="det-list"><li class="muted">awaiting signal…</li></ul>
+        <div id="suppressed-row" class="suppressed-row hidden">
+          <span class="ro-k">HIDDEN</span>
+          <span id="suppressed-list"></span>
+        </div>
       </div>
     </aside>
   </main>

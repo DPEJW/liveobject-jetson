@@ -349,3 +349,18 @@ input[type=range]::-moz-range-thumb {
 .tp-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; margin-bottom: 8px; }
 .tp-row .ro-k { color: var(--ink-dim); }
 #train-btn:disabled { opacity: .4; cursor: default; }
+
+/* ---- feedback ✓/✗ + suppressed-class chips + identity class tags ---- */
+.det-list .fb { background: none; border: 1px solid var(--hair); border-radius: 2px;
+  color: var(--ink-dim); cursor: pointer; font-size: 11px; line-height: 1;
+  padding: 3px 6px; flex: none; }
+.det-list .fb.good:hover { color: var(--amber); border-color: var(--amber); text-shadow: var(--glow); }
+.det-list .fb.bad:hover { color: var(--red); border-color: var(--red); }
+.cls-tag { background: var(--inset); border: 1px solid var(--hair-2); border-radius: 2px;
+  padding: 0 6px; font-size: 10px; color: var(--ink-dim); letter-spacing: .5px; }
+.suppressed-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 8px; font-size: 11px; }
+.suppressed-row .chip { background: var(--inset); border: 1px solid var(--hair);
+  border-radius: 2px; color: var(--ink-dim); cursor: pointer; font-size: 11px;
+  padding: 2px 8px; letter-spacing: .5px; }
+.suppressed-row .chip:hover { color: var(--amber); border-color: var(--amber); }

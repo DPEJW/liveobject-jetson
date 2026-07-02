@@ -277,12 +277,12 @@ class DetectionWorker:
         self.show_heatmap = True
         self.show_zones = True
 
-        # ---- cat re-identification (appearance) ----
+        # ---- object re-identification (appearance; any named class) ----
         self.roster = Roster(threshold=0.5)
         self._pending_enroll = None     # None | {"name":str,"x":float,"y":float}
-        self._enrolling = None          # {"name","tid","left"} while averaging a signature
+        self._enrolling = None          # {"name","cls","tid","left"} while averaging
 
-        # ---- training-set capture (only for manually-named cats) ----
+        # ---- training-set capture (only for manually-named objects) ----
         self.capture_enabled = True
         self.capture_conf = 0.80
         self.dataset_dir = os.path.expanduser("~/catdata")
@@ -290,20 +290,37 @@ class DetectionWorker:
         self._lbl_dir = os.path.join(self.dataset_dir, "labels")
         os.makedirs(self._img_dir, exist_ok=True)
         os.makedirs(self._lbl_dir, exist_ok=True)
-        self._class_map = {}            # name -> class idx (stable)
+        # Class ids must stay stable across restarts or old label files would
+        # silently mean a different name — reload the persisted map.
+        try:
+            with open(os.path.join(self.dataset_dir, "classes.json")) as fh:
+                self._class_map = {str(k): int(v) for k, v in json.load(fh).items()}
+        except (OSError, ValueError):
+            self._class_map = {}        # name -> class idx (stable)
         self._dataset_counts = {}       # name -> labeled instances saved
         self._last_capture_ts = None
         self._roster_path = os.path.join(self.dataset_dir, "roster.json")
         self.roster.load(self._roster_path)   # survive restarts
 
+        # ---- manual feedback (good/bad flags on detections) ----
+        self._pending_feedback = []     # [(track_id, "good"|"bad"), ...]
+        self._feedback_counts = {"good": 0, "bad": 0}
+        self._suppressed_path = os.path.join(self.dataset_dir, "suppressed.json")
+        try:
+            with open(self._suppressed_path) as fh:
+                self.suppressed = set(json.load(fh))
+        except (OSError, ValueError):
+            self.suppressed = set()     # COCO class names hidden by the user
+
         # ---- on-Orin training job ----
         self._train_proc = None
         self._paused_for_train = False
 
-        # ---- identity model (fine-tuned on the named cats) ----
+        # ---- identity model (fine-tuned on the named objects) ----
         self.identity_enabled = True
         self._identity_active = False
         self._identity_names = []
+        self._identity_cls = {}           # trained name -> base class (for merge)
         self._identity_dirty = True       # force an immediate manifest check
         self._identity_mtime = None       # mtime of the loaded manifest
         self._identity_check_ts = 0.0
@@ -419,13 +436,15 @@ class DetectionWorker:
         return self._track_snapshot      # atomically swapped reference; read-only
 
     # ---- worker-thread helpers (caller holds self._lock) ----
-    def enroll_cat(self, name, x, y):
+    def enroll_object(self, name, x, y):
+        """Queue enrollment of whatever detection the (normalized) click hits —
+        any class: cat, person, dog, … The identity remembers its base class."""
         with self._lock:
-            nm = str(name).strip()[:24] or "cat"
+            nm = str(name).strip()[:24] or "obj"
             self._pending_enroll = {"name": nm, "x": float(x), "y": float(y)}
         return {"queued": True}
 
-    def rename_cat(self, old, new):
+    def rename_object(self, old, new):
         nm = str(new).strip()[:24]
         with self._lock:
             self.roster.rename(str(old), nm)
@@ -434,7 +453,7 @@ class DetectionWorker:
             self.roster.save(self._roster_path)
         return {"ok": True}
 
-    def clear_cat(self, name):
+    def clear_object(self, name):
         with self._lock:
             self.roster.clear(str(name))
             if self._enrolling and self._enrolling["name"] == name:
@@ -442,14 +461,48 @@ class DetectionWorker:
             self.roster.save(self._roster_path)
         return {"ok": True}
 
+    # ---- manual feedback (good / bad flags) ----
+    def flag_detection(self, track_id, verdict):
+        """Queue a good/bad verdict on a live detection (from the UI ✓/✗).
+        Applied on the worker thread, which has the frame:
+          good + named   -> force-save a labeled training frame
+          bad  + named   -> save a hard-negative frame (region unlabeled) and
+                            un-stick the name from that track
+          bad  + generic -> suppress that COCO class (hide it; undo any time)"""
+        if verdict not in ("good", "bad"):
+            return {"error": "verdict must be good|bad"}
+        with self._lock:
+            self._pending_feedback.append((int(track_id), verdict))
+        return {"queued": True}
+
+    def unsuppress(self, name):
+        with self._lock:
+            self.suppressed.discard(str(name))
+            self._save_suppressed()
+        return {"suppressed": sorted(self.suppressed)}
+
+    def _save_suppressed(self):
+        try:
+            with open(self._suppressed_path, "w") as fh:
+                json.dump(sorted(self.suppressed), fh)
+        except OSError:
+            pass
+
     # ---- training control ----
     def _launch_train(self, epochs):
         import subprocess
-        vpy = os.path.expanduser("~/venvs/train/bin/python")
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_runner.py")
-        ob = os.path.expanduser("~/oblas/root/usr/lib/aarch64-linux-gnu")
+        base = os.path.dirname(os.path.abspath(__file__))
+        # Training python: prefer the project venv (GB10/Blackwell — torch +
+        # ultralytics live there), then the Orin's dedicated training venv,
+        # else whatever python is running the app.
+        vpy = next((p for p in (os.path.join(base, ".venv", "bin", "python"),
+                                os.path.expanduser("~/venvs/train/bin/python"))
+                    if os.path.exists(p)), sys.executable)
+        script = os.path.join(base, "train_runner.py")
         env = dict(os.environ)
-        env["LD_LIBRARY_PATH"] = f"{ob}/openblas-pthread:{ob}:" + env.get("LD_LIBRARY_PATH", "")
+        ob = os.path.expanduser("~/oblas/root/usr/lib/aarch64-linux-gnu")
+        if os.path.isdir(ob):  # Orin-only: openblas extracted from a .deb (no sudo)
+            env["LD_LIBRARY_PATH"] = f"{ob}/openblas-pthread:{ob}:" + env.get("LD_LIBRARY_PATH", "")
         log = open(os.path.join(self.dataset_dir, "train.log"), "w")
         return subprocess.Popen([vpy, script, str(int(epochs))], cwd=self.dataset_dir,
                                 stdout=log, stderr=subprocess.STDOUT,
@@ -486,6 +539,12 @@ class DetectionWorker:
                 current.reload(engine)
             self._identity_active = True
             self._identity_names = names
+            try:                       # name -> base class, for merge_identity
+                with open(os.path.join(self.dataset_dir, "classmeta.json")) as fh:
+                    self._identity_cls = {str(k): str(v)
+                                          for k, v in json.load(fh).items() if v}
+            except (OSError, ValueError):
+                self._identity_cls = {}
             print(f"[detector] identity model active: {names} <- {engine}",
                   file=sys.stderr)
             return current, names
@@ -524,15 +583,18 @@ class DetectionWorker:
         s = float(hist.sum())
         return hist / s if s > 0 else None
 
-    def _reid_cats(self, frame, tracked):
-        """Name cat detections by matching appearance to the enrolled roster;
-        reinforce the signature during an active enrollment window."""
-        cats = [(i, self._hs_signature(frame, tracked[i]["box"]))
-                for i, d in enumerate(tracked) if d["name"] == "cat"]
-        cats = [(i, s) for i, s in cats if s is not None]
-        if self.roster.names() and cats:
-            assigned = self.roster.assign([s for _, s in cats])
-            for (i, _), name in zip(cats, assigned):
+    def _reid_identities(self, frame, tracked):
+        """Name detections of ANY enrolled class by matching appearance to the
+        roster; reinforce the signature during an active enrollment window."""
+        enrolled_classes = set(self.roster.classes().values())
+        cands = [(i, self._hs_signature(frame, tracked[i]["box"]))
+                 for i, d in enumerate(tracked)
+                 if d["name"] in enrolled_classes]
+        cands = [(i, s) for i, s in cands if s is not None]
+        if self.roster.names() and cands:
+            assigned = self.roster.assign([s for _, s in cands],
+                                          clses=[tracked[i]["name"] for i, _ in cands])
+            for (i, _), name in zip(cands, assigned):
                 if name:                     # claim the name for this track id
                     tid = tracked[i]["id"]
                     for t2 in [t2 for t2, n2 in self._tid_names.items()
@@ -541,7 +603,7 @@ class DetectionWorker:
                     self._tid_names[tid] = name
         # sticky: a named track KEEPS its name even on frames where the
         # appearance match fails (kills the Dundun <-> "cat #N" flicker)
-        for i, _ in cats:
+        for i, _ in cands:
             nm = self._tid_names.get(tracked[i]["id"])
             if nm:
                 tracked[i]["label"] = nm
@@ -551,7 +613,7 @@ class DetectionWorker:
         if self._enrolling:
             e = self._enrolling
             t = self.tracker.get(e["tid"])
-            if t is not None and t.cls == "cat":
+            if t is not None and t.cls == e.get("cls", t.cls):
                 sig = self._hs_signature(frame, t.box)
                 if sig is not None:
                     self.roster.reinforce(e["name"], sig)
@@ -560,15 +622,11 @@ class DetectionWorker:
                 self._enrolling = None
                 self.roster.save(self._roster_path)
 
-    def _maybe_capture(self, frame, tracked, now):
-        """Save a labeled frame when a NAMED cat is confidently detected. Only
-        manually-enrolled cats are ever collected; frame-level time-spacing dedup."""
-        if not self.capture_enabled:
-            return
-        named = [d for d in tracked
-                 if d.get("reid") and d["score"] >= self.capture_conf]
-        if not named or not should_capture(now, self._last_capture_ts, 0.6):
-            return
+    def _save_labeled_frame(self, frame, named, prefix="cap"):
+        """Write one dataset sample: the frame + YOLO labels for the given named
+        detections (possibly none -> a pure hard-negative/background frame).
+        Also persists classes.json (name -> id) and classmeta.json (name ->
+        base class, so a retrained model's detections merge correctly)."""
         h, w = frame.shape[:2]
         lines = []
         for d in named:
@@ -578,12 +636,64 @@ class DetectionWorker:
             lines.append(to_yolo_label(d["box"], w, h, self._class_map[name]))
             self._dataset_counts[name] = self._dataset_counts.get(name, 0) + 1
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        cv2.imwrite(os.path.join(self._img_dir, f"cap_{ts}.jpg"), frame)
-        with open(os.path.join(self._lbl_dir, f"cap_{ts}.txt"), "w") as fh:
-            fh.write("\n".join(lines) + "\n")
+        cv2.imwrite(os.path.join(self._img_dir, f"{prefix}_{ts}.jpg"), frame)
+        with open(os.path.join(self._lbl_dir, f"{prefix}_{ts}.txt"), "w") as fh:
+            fh.write("\n".join(lines) + ("\n" if lines else ""))
         with open(os.path.join(self.dataset_dir, "classes.json"), "w") as fh:
             json.dump(self._class_map, fh)
+        meta = {n: c for n, c in self.roster.classes().items()}
+        meta.update({n: c for n, c in self._identity_cls.items() if c})
+        try:
+            with open(os.path.join(self.dataset_dir, "classmeta.json")) as fh:
+                old = json.load(fh)
+            old.update(meta)
+            meta = old
+        except (OSError, ValueError):
+            pass
+        with open(os.path.join(self.dataset_dir, "classmeta.json"), "w") as fh:
+            json.dump(meta, fh)
+
+    def _maybe_capture(self, frame, tracked, now):
+        """Save a labeled frame when a NAMED object is confidently detected. Only
+        manually-enrolled names are ever collected; frame-level time-spacing dedup."""
+        if not self.capture_enabled:
+            return
+        named = [d for d in tracked
+                 if d.get("reid") and d["score"] >= self.capture_conf]
+        if not named or not should_capture(now, self._last_capture_ts, 0.6):
+            return
+        self._save_labeled_frame(frame, named)
         self._last_capture_ts = now
+
+    def _apply_feedback(self, frame, tracked):
+        """Process queued ✓/✗ verdicts (worker thread, lock held, frame in hand)."""
+        pending, self._pending_feedback = self._pending_feedback, []
+        for tid, verdict in pending:
+            d = next((t for t in tracked if t["id"] == tid), None)
+            if d is None:
+                continue
+            named = [t for t in tracked if t.get("reid")]
+            if verdict == "good" and d.get("reid"):
+                # Manual positive: save right now, bypassing conf/time gates.
+                # Label EVERY named det in frame so others don't become
+                # accidental negatives.
+                self._save_labeled_frame(frame, named, prefix="fb")
+                self._feedback_counts["good"] += 1
+            elif verdict == "bad" and d.get("reid"):
+                # Hard negative: this region is NOT that name. Save the frame
+                # with every named det EXCEPT this one; un-stick the wrong name.
+                self._save_labeled_frame(
+                    frame, [t for t in named if t["id"] != tid], prefix="neg")
+                self._tid_names.pop(tid, None)
+                d.pop("reid", None)
+                d["label"] = f'{d["name"]} #{tid}'
+                self._feedback_counts["bad"] += 1
+            elif verdict == "bad":
+                # Generic COCO false positive: the frozen base model can't be
+                # retrained, so hide the class (reversible via unsuppress).
+                self.suppressed.add(d["name"])
+                self._save_suppressed()
+                self._feedback_counts["bad"] += 1
 
     def _reset_tracking(self):
         """Scene changed (camera/rotation): drop session + zones (keep the cat roster)."""
@@ -629,13 +739,13 @@ class DetectionWorker:
             tid = hit_test(tracked, req["x"], req["y"], self._fw, self._fh)
             if tid is not None:
                 t = self.tracker.get(int(tid))
-                if t is not None and t.cls == "cat":
+                if t is not None:                    # any class is enrollable
                     sig = self._hs_signature(frame, t.box)
                     if sig is not None:
-                        self.roster.enroll(req["name"], sig)
+                        self.roster.enroll(req["name"], sig, cls=t.cls)
                         self.roster.save(self._roster_path)
-                        self._enrolling = {"name": req["name"], "tid": int(tid),
-                                           "left": 12}
+                        self._enrolling = {"name": req["name"], "cls": t.cls,
+                                           "tid": int(tid), "left": 12}
 
     def _build_snapshot(self, tracked):
         tracks = [{"id": d["id"], "label": d["label"], "cls": d["name"],
@@ -644,9 +754,12 @@ class DetectionWorker:
                    "selected": d["id"] == self._selected_id} for d in tracked]
         summary = self._session.summary() if self._session is not None else None
         return {"tracks": tracks, "track": summary, "zones": self.zones.list(),
-                "cats": self.roster.names(),
+                "identities": [{"name": n, "cls": self.roster.base_cls(n)}
+                               for n in self.roster.names()],
                 "enrolling": self._enrolling["name"] if self._enrolling else None,
-                "dataset": dict(self._dataset_counts)}
+                "dataset": dict(self._dataset_counts),
+                "suppressed": sorted(self.suppressed),
+                "feedback": dict(self._feedback_counts)}
 
     def config(self):
         return {
@@ -757,12 +870,15 @@ class DetectionWorker:
                     t0 = time.perf_counter()
                     raw = model.infer(frame, conf=self.threshold)
                     dets = self._to_dets(raw)
+                    if self.suppressed:      # classes the user ✗-flagged away
+                        dets = [d for d in dets if d["name"] not in self.suppressed]
                     if identity is not None and self.identity_enabled and id_names:
                         id_raw = identity.infer(frame, conf=0.50)
                         id_dets = [{"name": id_names[c] if c < len(id_names) else str(c),
                                     "score": float(s), "box": b}
                                    for c, s, b in id_raw]
-                        dets = merge_identity(dets, id_dets)
+                        dets = merge_identity(dets, id_dets,
+                                              base_cls=self._identity_cls)
                     self.infer_ms = (time.perf_counter() - t0) * 1000.0
                     self._fh, self._fw = frame.shape[0], frame.shape[1]
                     now = time.perf_counter()
@@ -784,7 +900,8 @@ class DetectionWorker:
                                            if t in self.tracker.tracks}
                         self._last_tracks = tracked
                         self._apply_pending(tracked, frame)
-                        self._reid_cats(frame, tracked)
+                        self._reid_identities(frame, tracked)
+                        self._apply_feedback(frame, tracked)
                         self._maybe_capture(frame, tracked, now)
                         self.zones.update_auto([d for d in tracked
                                                 if d["name"] in ZONE_CLASSES])

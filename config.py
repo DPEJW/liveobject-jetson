@@ -36,15 +36,18 @@ _load_env_file(BASE_DIR / ".camera.env")
 # comparison (all 80 COCO classes). Only engines that have actually been built
 # are offered; default prefers the newest available.
 _ALL_MODELS = {
-    "yolo26m": str(MODELS_DIR / "yolo26m.engine"),
+    "yolo26x-hd": str(MODELS_DIR / "yolo26x_hd.engine"),  # 26x @ 1280 — best accuracy
+    "yolo26x": str(MODELS_DIR / "yolo26x.engine"),
     "yolo26l": str(MODELS_DIR / "yolo26l.engine"),
+    "yolo26m": str(MODELS_DIR / "yolo26m.engine"),
     "yolo12m": str(MODELS_DIR / "yolo12m.engine"),
     "yolo11m": str(MODELS_DIR / "yolo11m.engine"),
 }
 MODELS = {k: v for k, v in _ALL_MODELS.items() if Path(v).exists()}
 if not MODELS:                       # fall back so the app can still start
     MODELS = {"yolo11m": _ALL_MODELS["yolo11m"]}
-DEFAULT_MODEL = next((k for k in ("yolo26m", "yolo26l", "yolo12m") if k in MODELS),
+DEFAULT_MODEL = next((k for k in ("yolo26x-hd", "yolo26x", "yolo26l", "yolo26m",
+                                  "yolo12m") if k in MODELS),
                      next(iter(MODELS)))
 
 # Display (main) stream size in landscape orientation. Rotation is applied per
