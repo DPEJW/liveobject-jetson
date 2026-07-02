@@ -8,6 +8,7 @@ public DetectionWorker interface (used by app.py) is unchanged.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sys
@@ -23,6 +24,7 @@ import config
 from config import (DEFAULTS, DEFAULT_MODEL, DISPLAY_SIZE, MODELS,
                     SNAPSHOT_DIR)
 from labels import COCO_LABELS
+from capture import should_capture, to_yolo_label
 from reid import Roster
 from tracking import IoUTracker, TrackSession, ZoneRegistry, hit_test
 from trt_yolo import TRTYolo
@@ -280,6 +282,18 @@ class DetectionWorker:
         self._pending_enroll = None     # None | {"name":str,"x":float,"y":float}
         self._enrolling = None          # {"name","tid","left"} while averaging a signature
 
+        # ---- training-set capture (only for manually-named cats) ----
+        self.capture_enabled = True
+        self.capture_conf = 0.80
+        self.dataset_dir = os.path.expanduser("~/catdata")
+        self._img_dir = os.path.join(self.dataset_dir, "images")
+        self._lbl_dir = os.path.join(self.dataset_dir, "labels")
+        os.makedirs(self._img_dir, exist_ok=True)
+        os.makedirs(self._lbl_dir, exist_ok=True)
+        self._class_map = {}            # name -> class idx (stable)
+        self._dataset_counts = {}       # name -> labeled instances saved
+        self._last_capture_ts = None
+
         SNAPSHOT_DIR.mkdir(exist_ok=True)
 
     # ---- lifecycle ----
@@ -446,6 +460,31 @@ class DetectionWorker:
             if e["left"] <= 0:
                 self._enrolling = None
 
+    def _maybe_capture(self, frame, tracked, now):
+        """Save a labeled frame when a NAMED cat is confidently detected. Only
+        manually-enrolled cats are ever collected; frame-level time-spacing dedup."""
+        if not self.capture_enabled:
+            return
+        named = [d for d in tracked
+                 if d.get("reid") and d["score"] >= self.capture_conf]
+        if not named or not should_capture(now, self._last_capture_ts, 0.6):
+            return
+        h, w = frame.shape[:2]
+        lines = []
+        for d in named:
+            name = d["reid"]
+            if name not in self._class_map:
+                self._class_map[name] = len(self._class_map)
+            lines.append(to_yolo_label(d["box"], w, h, self._class_map[name]))
+            self._dataset_counts[name] = self._dataset_counts.get(name, 0) + 1
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        cv2.imwrite(os.path.join(self._img_dir, f"cap_{ts}.jpg"), frame)
+        with open(os.path.join(self._lbl_dir, f"cap_{ts}.txt"), "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        with open(os.path.join(self.dataset_dir, "classes.json"), "w") as fh:
+            json.dump(self._class_map, fh)
+        self._last_capture_ts = now
+
     def _reset_tracking(self):
         """Scene changed (camera/rotation): drop session + zones (keep the cat roster)."""
         self.tracker = IoUTracker()
@@ -504,7 +543,8 @@ class DetectionWorker:
         summary = self._session.summary() if self._session is not None else None
         return {"tracks": tracks, "track": summary, "zones": self.zones.list(),
                 "cats": self.roster.names(),
-                "enrolling": self._enrolling["name"] if self._enrolling else None}
+                "enrolling": self._enrolling["name"] if self._enrolling else None,
+                "dataset": dict(self._dataset_counts)}
 
     def config(self):
         return {
@@ -599,6 +639,7 @@ class DetectionWorker:
                         self._last_tracks = tracked
                         self._apply_pending(tracked, frame)
                         self._reid_cats(frame, tracked)
+                        self._maybe_capture(frame, tracked, now)
                         self.zones.update_auto([d for d in tracked
                                                 if d["name"] in ZONE_CLASSES])
                         if (self._selected_id is not None and self._session is not None
