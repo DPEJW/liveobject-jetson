@@ -92,7 +92,8 @@ def main():
         return
 
     epochs = int(sys.argv[1]) if len(sys.argv) > 1 else 30
-    imgsz = 320
+    imgsz = 640    # MUST match the ONNX/TensorRT export size — training at 320
+                   # while deploying at 640 made the model near-blind live
     try:
         names = load_names()
     except Exception:
