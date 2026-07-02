@@ -439,7 +439,8 @@ class DetectionWorker:
         env["LD_LIBRARY_PATH"] = f"{ob}/openblas-pthread:{ob}:" + env.get("LD_LIBRARY_PATH", "")
         log = open(os.path.join(self.dataset_dir, "train.log"), "w")
         return subprocess.Popen([vpy, script, str(int(epochs))], cwd=self.dataset_dir,
-                                stdout=log, stderr=subprocess.STDOUT, env=env)
+                                stdout=log, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, start_new_session=True, env=env)
 
     def start_training(self, epochs=30):
         with self._lock:
