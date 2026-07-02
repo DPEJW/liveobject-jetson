@@ -91,9 +91,9 @@ def main():
         model.train(data=data_yaml, epochs=epochs, imgsz=imgsz, batch=8, device=0,
                     workers=2, project=os.path.join(DATA, "train_out"), name="model",
                     exist_ok=True, plots=False, verbose=False)
-        best = os.path.join(DATA, "train_out", "model", "weights", "best.pt")
-        write_status(state="done", epoch=epochs, epochs=epochs, names=names,
-                     best=best if os.path.exists(best) else None)
+        cands = glob.glob(os.path.join(DATA, "train_out", "*", "weights", "best.pt"))
+        best = max(cands, key=os.path.getmtime) if cands else None
+        write_status(state="done", epoch=epochs, epochs=epochs, names=names, best=best)
     except Exception as exc:
         write_status(state="error", msg=str(exc)[:300])
 
