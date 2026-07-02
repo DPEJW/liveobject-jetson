@@ -155,6 +155,9 @@ const mapChart = new Chart($("mapChart"), {
                    grid: { color: "rgba(110,150,175,.08)" }, border: { display: false } } } },
 });
 let trainLastEpoch = -1;
+let identEnabled = true;
+$("ident-toggle").addEventListener("click", () =>
+  postConfig({ identity_enabled: !identEnabled }));
 $("train-btn").addEventListener("click", () =>
   fetch("/train", { method: "POST", headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ action: "start" }) }));
@@ -165,10 +168,18 @@ $("train-cancel").addEventListener("click", () =>
 function trainPoll() {
   fetch("/train/status").then((r) => r.json()).then((t) => {
     const st = t.state || "idle";
-    $("train-state").textContent = t.running ? (st === "starting" ? "starting" : "training") : st;
-    $("train-prog").classList.toggle("hidden", !(t.running || st === "training" || st === "starting" || st === "done" || st === "error"));
+    $("train-state").textContent = t.running ? st : st;
+    $("train-prog").classList.toggle("hidden",
+      !(t.running || ["training", "starting", "exporting", "building", "done", "error"].includes(st)));
     $("train-cancel").classList.toggle("hidden", !t.running);
     $("train-btn").disabled = !!t.running;
+    $("train-overlay").classList.toggle("hidden", !t.running);
+    if (t.running) {
+      $("train-overlay-tx").textContent =
+        st === "exporting" ? "⚙ EXPORTING MODEL — FEED PAUSED"
+        : st === "building" ? "⚙ BUILDING TENSORRT ENGINE — FEED PAUSED (a few minutes)"
+        : `⚙ TRAINING ${t.epoch || 0}/${t.epochs || "?"} — FEED PAUSED`;
+    }
     if (st === "error") {
       $("tp-epoch").textContent = "—";
       $("tp-map").textContent = String(t.msg || t.err || "error").slice(0, 40);
@@ -247,6 +258,8 @@ setInterval(tick, 1000); tick();
 function renderDetections(dets) {
   const list = $("det-list");
   if (!dets.length) { list.innerHTML = '<li class="muted">no objects detected</li>'; return; }
+  dets = dets.slice().sort((a, b) =>            // stable order: no row jumping
+    a.name < b.name ? -1 : a.name > b.name ? 1 : b.score - a.score);
   list.innerHTML = dets.map((d) =>
     `<li><span class="swatch" style="background:${colorFor(d.name)}"></span>` +
     `<span class="nm">${d.name}</span>` +
@@ -331,7 +344,7 @@ function poll() {
           + `<span class="nm">${n}</span><span class="sc">${ds[n]} frames</span></li>`).join("")
       : '<li class="muted">no samples yet — name a cat & keep it in view</li>';
 
-    const tracks = s.tracks || [];
+    const tracks = (s.tracks || []).slice().sort((a, b) => a.id - b.id);  // stable rows
     $("trk-list").innerHTML = tracks.length
       ? tracks.map((t) =>
           `<li data-id="${t.id}" class="${t.selected ? "sel" : ""}">`
@@ -341,8 +354,7 @@ function poll() {
       : '<li class="muted">no objects yet</li>';
 
     const tk = s.track;
-    $("trk-readout").classList.toggle("hidden", !tk);
-    $("trk-stop").classList.toggle("hidden", !tk || tk.state === "stopped");
+    $("trk-stop").classList.toggle("invis", !tk || tk.state === "stopped");
     $("trk-state").textContent = tk ? tk.state : "idle";
     if (tk) {
       $("trk-elapsed").textContent = fmtDur(tk.elapsed_s);
@@ -353,7 +365,19 @@ function poll() {
       $("trk-zones").innerHTML = (tk.zones || []).map((z) =>
         `<li><span class="nm">${z.label}</span>`
         + `<span class="sc">${fmtDur(z.dwell_s)}</span></li>`).join("");
+    } else {                                       // keep size: dashes, not hiding
+      ["trk-elapsed", "trk-moving", "trk-still", "trk-dist", "trk-place"]
+        .forEach((id) => { $(id).textContent = "—"; });
+      $("trk-zones").innerHTML = "";
     }
+
+    const idNames = cfg.identity_names || [];
+    $("ident-names").textContent = idNames.length
+      ? idNames.join(", ") + (cfg.identity_active ? "" : " (loading…)")
+      : "not trained yet";
+    identEnabled = !!cfg.identity_enabled;
+    $("ident-toggle").textContent = identEnabled ? "ON" : "OFF";
+    $("ident-toggle").classList.toggle("on", identEnabled);
 
     pushPoint(fpsChart, s.fps);
     pushPoint(ramChart, ram);

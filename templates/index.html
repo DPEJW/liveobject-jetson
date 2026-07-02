@@ -42,6 +42,7 @@
         <span class="bk bl" aria-hidden="true"></span>
         <span class="bk br" aria-hidden="true"></span>
         <div id="paused-overlay" class="overlay hidden"><span>◼ PAUSED</span></div>
+        <div id="train-overlay" class="overlay hidden"><span id="train-overlay-tx">⚙ TRAINING — FEED PAUSED</span></div>
         <button id="fs-btn" class="fs-btn" title="Fullscreen" aria-label="Fullscreen">⛶</button>
         <button id="fs-exit" class="fs-exit hidden" title="Exit fullscreen (Esc)">✕ EXIT</button>
       </div>
@@ -63,7 +64,7 @@
         </div>
         <ul id="cats-list" class="cats-list"></ul>
         <ul id="trk-list" class="trk-list"><li class="muted">no objects yet</li></ul>
-        <div class="trk-readout hidden" id="trk-readout">
+        <div class="trk-readout" id="trk-readout">
           <div class="ro"><span class="ro-k">ELAPSED</span><b id="trk-elapsed">0s</b></div>
           <div class="ro"><span class="ro-k">MOVING</span><b id="trk-moving">0s</b></div>
           <div class="ro"><span class="ro-k">STILL</span><b id="trk-still">0s</b></div>
@@ -72,7 +73,7 @@
         </div>
         <ul id="trk-zones" class="det-list"></ul>
         <div class="btn-row">
-          <button id="trk-stop" class="btn hidden">STOP TRACKING</button>
+          <button id="trk-stop" class="btn invis">STOP TRACKING</button>
         </div>
         <div class="btn-row trk-toggles">
           <button id="tg-trail" class="btn ghost on">TRAIL</button>
@@ -84,6 +85,11 @@
       <div class="card" data-reveal="2">
         <h2>Training <span id="train-state" class="tag">idle</span></h2>
         <ul id="ds-counts" class="cats-list"><li class="muted">no samples yet</li></ul>
+        <div class="model-row">
+          <span class="ro-k">CUSTOM MODEL</span>
+          <b id="ident-names" class="alt">not trained yet</b>
+          <button id="ident-toggle" class="btn ghost on">ON</button>
+        </div>
         <div class="btn-row">
           <button id="train-btn" class="btn">TRAIN</button>
           <button id="train-cancel" class="btn ghost hidden">CANCEL</button>

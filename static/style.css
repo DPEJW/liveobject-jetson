@@ -332,6 +332,18 @@ input[type=range]::-moz-range-thumb {
 .cats-list .x { margin-left: auto; background: none; border: 0; color: var(--ink-dim); cursor: pointer; }
 .cats-list .x:hover { color: var(--red); }
 
+/* ---- fixed-size lists: the panel must NEVER jump as objects come and go ---- */
+.cats-list, #ds-counts { height: 58px; overflow-y: auto; }
+.trk-list { height: 126px; overflow-y: auto; }
+#trk-zones { height: 52px; overflow-y: auto; }
+.det-list { height: 148px; overflow-y: auto; }
+.invis { visibility: hidden !important; }
+.panel ::-webkit-scrollbar { width: 5px; }
+.panel ::-webkit-scrollbar-thumb { background: rgba(150,185,205,.22); border-radius: 3px; }
+.model-row { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 12px; }
+.model-row .ro-k { color: var(--ink-dim); }
+.model-row b { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* ---- training progress ---- */
 .train-prog { margin-top: 8px; }
 .tp-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; margin-bottom: 8px; }
