@@ -304,7 +304,9 @@ class DetectionWorker:
         self.identity_enabled = True
         self._identity_active = False
         self._identity_names = []
-        self._identity_dirty = True       # load manifest on worker start
+        self._identity_dirty = True       # force an immediate manifest check
+        self._identity_mtime = None       # mtime of the loaded manifest
+        self._identity_check_ts = 0.0
         self._tid_names = {}              # track id -> sticky enrolled name
         self._score_ema = {}              # track id -> smoothed display score
 
@@ -725,9 +727,20 @@ class DetectionWorker:
                             time.sleep(0.3)
                             continue
 
-                    if self._identity_dirty:
+                    # watch the manifest: (re)load whenever it appears or changes,
+                    # not just once at startup (an engine can land at any time)
+                    nowt = time.monotonic()
+                    if self._identity_dirty or nowt - self._identity_check_ts >= 5.0:
+                        self._identity_check_ts = nowt
                         self._identity_dirty = False
-                        identity, id_names = self._load_identity(identity)
+                        mf = os.path.join(self.dataset_dir, "identity", "manifest.json")
+                        try:
+                            mt = os.path.getmtime(mf)
+                        except OSError:
+                            mt = None
+                        if mt != self._identity_mtime:
+                            self._identity_mtime = mt
+                            identity, id_names = self._load_identity(identity)
 
                     frame = source.read()
                     if frame is None:
