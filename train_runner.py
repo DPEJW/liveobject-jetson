@@ -17,14 +17,12 @@ import json
 import os
 import random
 import shutil
-import subprocess
 import sys
 import time
 
 DATA = os.path.expanduser("~/catdata")
 STATUS = os.path.join(DATA, "train_status.json")
 IDENT = os.path.join(DATA, "identity")
-TRTEXEC = "/usr/src/tensorrt/bin/trtexec"
 
 
 def write_status(**kw):
@@ -53,14 +51,17 @@ def export_deploy(best, names):
     engine = os.path.join(IDENT, "identity_%s.engine" % time.strftime("%Y%m%d_%H%M%S"))
     write_status(state="building", names=names,
                  msg="TensorRT engine build (takes a few minutes)")
-    env = dict(os.environ)
-    env.pop("CUDA_VISIBLE_DEVICES", None)   # ultralytics cpu-export sets it to "" —
-    r = subprocess.run([TRTEXEC, "--onnx=%s" % onnx_path, "--saveEngine=%s" % engine,
-                        "--fp16"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                       timeout=2400, env=env)
-    if r.returncode != 0 or not os.path.exists(engine):
-        tail = r.stdout.decode(errors="replace")[-400:]
-        write_status(state="error", msg="trtexec failed: " + tail)
+    # ultralytics' cpu export sets CUDA_VISIBLE_DEVICES="", which would hide the
+    # GPU from the TensorRT builder — restore it before building.
+    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+    try:
+        from build_engine import build_engine
+        build_engine(onnx_path, engine, fp16=True)   # TRT Python API (no trtexec)
+    except Exception as e:
+        write_status(state="error", msg="engine build failed: %s" % e)
+        return None
+    if not os.path.exists(engine):
+        write_status(state="error", msg="engine build produced no file")
         return None
     manifest = {"engine": engine, "names": names, "built": time.time(), "best": best}
     tmp = os.path.join(IDENT, "manifest.json.tmp")

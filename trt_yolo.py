@@ -1,69 +1,120 @@
-"""TensorRT YOLO (v8/v11/v12/26) detector for the Jetson.
+"""TensorRT YOLO (v8/v11/v12/26) detector — Blackwell / CUDA 13 edition.
 
-Replaces the Pi's Hailo NPU path. Loads a serialized .engine built by trtexec
-from an Ultralytics-exported ONNX, runs inference on the GPU via pycuda, and
-decodes the (1, 84, 8400) detection head into COCO boxes. (YOLO26 must be
-exported with end2end=False to keep this traditional head; its default NMS-free
-end2end head emits (1, 300, 6) instead and is not decoded here.)
+Ported from the Jetson Orin (TensorRT 8.5 + pycuda) to the NVIDIA GB10
+(Grace-Blackwell, CUDA 13, TensorRT 10/11). Two things changed vs. the Orin
+version; the detection logic (letterbox, (1,84,8400) decode, NMS) is identical:
 
-All CUDA calls must happen on the thread that created this object (the
-DetectionWorker thread); the primary context is pushed/popped around every op.
+  * Engine/tensor API: TensorRT 8.5's binding-index API (num_bindings,
+    get_binding_shape, execute_async_v2) was removed in TensorRT 10. This uses
+    the name-based I/O API (num_io_tensors / get_tensor_name / get_tensor_shape
+    / set_tensor_address / execute_async_v3).
+  * CUDA plumbing: pycuda won't build against CUDA 13, so device memory, streams
+    and copies go through NVIDIA's official cuda-python (cuda.bindings.runtime).
+
+Loads a serialized .engine (build one with build_engine.py from an
+Ultralytics-exported ONNX), runs inference on the GPU, and decodes the
+(1, 84, 8400) detection head into COCO boxes. (YOLO26 must be exported with
+end2end=False to keep this traditional head; its default NMS-free end2end head
+emits (1, 300, 6) instead and is not decoded here.)
+
+All CUDA/TensorRT calls must happen on the thread that created this object (the
+DetectionWorker thread) — cuda-python binds the primary context per-thread on
+first use, and the execution context is not thread-safe.
 """
 from __future__ import annotations
 
 import cv2
 import numpy as np
 
-# numpy>=1.24 removed these aliases that TensorRT 8.5's python bindings still use.
-for _a, _t in (("bool", bool), ("float", float), ("int", int), ("object", object)):
-    if not hasattr(np, _a):
-        setattr(np, _a, _t)
-
 import tensorrt as trt
-import pycuda.driver as cuda
+from cuda.bindings import runtime as cudart
 
 _TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
 
+def _check(err, what=""):
+    """Raise on a non-success cudaError_t (cuda-python returns (err, *rest))."""
+    if isinstance(err, tuple):
+        err = err[0]
+    if err != cudart.cudaError_t.cudaSuccess:
+        name = cudart.cudaGetErrorString(err)[1]
+        raise RuntimeError(f"CUDA error in {what}: {name}")
+
+
+class _IOTensor:
+    __slots__ = ("name", "shape", "dtype", "nbytes", "host", "dev")
+
+    def __init__(self, name, shape, dtype):
+        self.name = name
+        self.shape = shape
+        self.dtype = dtype
+        self.host = np.empty(shape, dtype=dtype)
+        self.nbytes = self.host.nbytes
+        err, self.dev = cudart.cudaMalloc(self.nbytes)
+        _check(err, f"cudaMalloc({name})")
+
+
 class TRTYolo:
     def __init__(self, engine_path: str, input_size: int = 640, iou: float = 0.45):
-        cuda.init()
-        self.ctx = cuda.Device(0).retain_primary_context()
         self.input_size = input_size
         self.iou = iou
-        self.ctx.push()
-        try:
-            self.stream = cuda.Stream()
-            self._load(engine_path)
-        finally:
-            self.ctx.pop()
-
-    # ---- engine (re)loading ----
-    def _load(self, engine_path: str) -> None:
-        with open(engine_path, "rb") as f, trt.Runtime(_TRT_LOGGER) as rt:
-            self.engine = rt.deserialize_cuda_engine(f.read())
-        self.context = self.engine.create_execution_context()
-        self.bindings = []
+        _check(cudart.cudaSetDevice(0), "cudaSetDevice")
+        err, self.stream = cudart.cudaStreamCreate()
+        _check(err, "cudaStreamCreate")
+        self.engine = None
+        self.context = None
         self.inp = None
         self.out = None
-        for i in range(self.engine.num_bindings):
-            shape = tuple(self.engine.get_binding_shape(i))
-            dtype = trt.nptype(self.engine.get_binding_dtype(i))
-            host = cuda.pagelocked_empty(int(np.prod(shape)), dtype)
-            dev = cuda.mem_alloc(host.nbytes)
-            self.bindings.append(int(dev))
-            slot = {"host": host, "dev": dev, "shape": shape, "dtype": dtype}
-            if self.engine.binding_is_input(i):
-                self.inp = slot
+        self._load(engine_path)
+
+    # ---- engine (re)loading ----
+    def _free_io(self):
+        for t in (self.inp, self.out):
+            if t is not None and t.dev is not None:
+                cudart.cudaFree(t.dev)
+        self.inp = self.out = None
+
+    def _load(self, engine_path: str) -> None:
+        with open(engine_path, "rb") as f:
+            runtime = trt.Runtime(_TRT_LOGGER)
+            engine = runtime.deserialize_cuda_engine(f.read())
+        if engine is None:
+            raise RuntimeError(f"failed to deserialize engine: {engine_path}")
+        context = engine.create_execution_context()
+
+        self._free_io()
+        inp = out = None
+        for i in range(engine.num_io_tensors):
+            name = engine.get_tensor_name(i)
+            is_input = engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+            shape = tuple(engine.get_tensor_shape(name))
+            # Resolve a dynamic batch/spatial dim to a concrete size (1, imgsz).
+            if is_input and any(d < 0 for d in shape):
+                shape = tuple(self.input_size if d < 0 and j >= 2 else (1 if d < 0 else d)
+                              for j, d in enumerate(shape))
+                context.set_input_shape(name, shape)
+            dtype = trt.nptype(engine.get_tensor_dtype(name))
+            t = _IOTensor(name, shape, dtype)
+            context.set_tensor_address(name, int(t.dev))
+            if is_input:
+                inp = t
             else:
-                self.out = slot
+                # Output shape may only be known after the input shape is set.
+                oshape = tuple(context.get_tensor_shape(name))
+                if oshape != t.shape:
+                    cudart.cudaFree(t.dev)
+                    t = _IOTensor(name, oshape, dtype)
+                    context.set_tensor_address(name, int(t.dev))
+                out = t
+
+        if inp is None or out is None:
+            raise RuntimeError("engine must expose one input and one output tensor")
+        # Swap in the new engine/context/buffers only once everything is wired.
+        self.engine, self.context, self.inp, self.out = engine, context, inp, out
 
     def reload(self, engine_path: str) -> None:
-        self.ctx.push()
-        try:
-            self._load(engine_path)
-        finally:
-            self.ctx.pop()
+        """Hot-swap the engine in place (used by the identity-model swap)."""
+        self._load(engine_path)
 
     # ---- preprocessing ----
     def _letterbox(self, im, color=(114, 114, 114)):
@@ -83,18 +134,27 @@ class TRTYolo:
         """Return a list of (class_id, score, [x0,y0,x1,y1]) in bgr-pixel coords."""
         img, r, dw, dh = self._letterbox(bgr)
         blob = img[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0  # BGR->RGB, HWC->CHW
-        blob = np.ascontiguousarray(blob).ravel()
+        blob = np.ascontiguousarray(blob, dtype=self.inp.dtype)
 
-        self.ctx.push()
-        try:
-            np.copyto(self.inp["host"], blob.astype(self.inp["dtype"], copy=False))
-            cuda.memcpy_htod_async(self.inp["dev"], self.inp["host"], self.stream)
-            self.context.execute_async_v2(self.bindings, self.stream.handle)
-            cuda.memcpy_dtoh_async(self.out["host"], self.out["dev"], self.stream)
-            self.stream.synchronize()
-            out = np.array(self.out["host"]).reshape(self.out["shape"])
-        finally:
-            self.ctx.pop()
+        np.copyto(self.inp.host, blob.reshape(self.inp.shape))
+        _check(cudart.cudaMemcpyAsync(
+            self.inp.dev, self.inp.host.ctypes.data, self.inp.nbytes,
+            cudart.cudaMemcpyKind.cudaMemcpyHostToDevice, self.stream), "H2D")
+        if not self.context.execute_async_v3(self.stream):
+            raise RuntimeError("execute_async_v3 failed")
+        _check(cudart.cudaMemcpyAsync(
+            self.out.host.ctypes.data, self.out.dev, self.out.nbytes,
+            cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost, self.stream), "D2H")
+        _check(cudart.cudaStreamSynchronize(self.stream), "streamSync")
+        out = self.out.host
+
+        # Two head layouts are supported (auto-detected by output shape):
+        #   * (1, 84, 8400)  traditional one-to-many head -> argmax + cv2 NMS.
+        #   * (1, N, 6)      YOLO26 NMS-free "end2end" head, already decoded to
+        #                    [x0, y0, x1, y1, score, class] rows in letterbox
+        #                    space -> just filter + rescale.
+        if out.ndim == 3 and out.shape[2] == 6:
+            return self._decode_end2end(out, conf, r, dw, dh, bgr.shape[:2])
 
         # (1, 84, 8400) -> (8400, 84)
         p = out[0].transpose(1, 0)
@@ -125,3 +185,33 @@ class TRTYolo:
                  int(min(W, x1[i])), int(min(H, y1[i]))],
             ))
         return results
+
+    def _decode_end2end(self, out, conf, r, dw, dh, hw):
+        """Decode the YOLO26 NMS-free head (1, N, 6): rows are
+        [x0, y0, x1, y1, score, class] in letterbox pixels, already NMS'd."""
+        rows = out[0].astype(np.float32)
+        keep = rows[:, 4] >= conf
+        rows = rows[keep]
+        if rows.shape[0] == 0:
+            return []
+        H, W = hw
+        results = []
+        for x0, y0, x1, y1, score, cls in rows:
+            x0 = (x0 - dw) / r
+            y0 = (y0 - dh) / r
+            x1 = (x1 - dw) / r
+            y1 = (y1 - dh) / r
+            results.append((
+                int(cls), float(score),
+                [int(max(0, x0)), int(max(0, y0)),
+                 int(min(W, x1)), int(min(H, y1))],
+            ))
+        return results
+
+    def __del__(self):
+        try:
+            self._free_io()
+            if getattr(self, "stream", None) is not None:
+                cudart.cudaStreamDestroy(self.stream)
+        except Exception:
+            pass

@@ -1,15 +1,51 @@
-# liveobject (Jetson Orin NX edition)
+# liveobject
 
-Live object-detection web app for the **NVIDIA Jetson Orin NX** with a **Basler
-GigE Vision** camera and **TensorRT** (YOLO26 / YOLO11) inference on the GPU.
+Live object-detection web app with **TensorRT** (YOLO26 / YOLO11) inference on
+an NVIDIA GPU. It serves a browser dashboard with the live camera feed, bounding
+boxes + class names + confidence, live detection controls, object tracking,
+cat re-ID + on-device retrain, and real-time FPS / inference timing.
 
-It serves a browser dashboard with the live camera feed, bounding boxes + class
-names + confidence, live detection controls, and real-time FPS / inference
-timing.
+> **Two hardware targets, one codebase:**
+> - **Jetson Orin NX** (`main` / `feat/cat-reid-retrain` branches) — Basler GigE
+>   camera via pypylon, TensorRT 8.5 + pycuda, CUDA 11.4, Python 3.8.
+> - **NVIDIA GB10 / Grace-Blackwell** (`feat/blackwell-gb10` branch, this one) —
+>   network Reolink RTSP camera (FFmpeg decode), **TensorRT 11 + cuda-python**,
+>   CUDA 13, Python 3.12. See **"Blackwell / GB10 notes"** below.
+>
+> Originally ported from the Raspberry Pi 5 + AI HAT+ (Hailo-10H) version. The
+> public `DetectionWorker` interface is unchanged across all three — only the
+> camera and inference backends are swapped.
 
-> Ported from the Raspberry Pi 5 + AI HAT+ (Hailo-10H) version (the original
-> `liveobject` repo). The public `DetectionWorker` interface is unchanged — only
-> the camera and inference backends were swapped.
+---
+
+## Blackwell / GB10 notes
+
+What changed from the Jetson version (all in `trt_yolo.py`, `build_engine.py`,
+`train_runner.py`), and why:
+
+| Concern | Jetson Orin NX | GB10 / Blackwell (this branch) |
+|---|---|---|
+| GPU / arch | Ampere, `sm_87` | **Blackwell GB10, `sm_121`** |
+| CUDA / TensorRT | 11.4 / **8.5.2** | 13.0 / **11.1** |
+| Python | 3.8 | **3.12** |
+| CUDA memory ops | **pycuda** | **cuda-python** (`cuda.bindings.runtime`) — pycuda won't build on CUDA 13 |
+| TRT tensor I/O | binding-index API (`num_bindings`, `execute_async_v2`) | **name-based API** (`num_io_tensors`, `set_tensor_address`, `execute_async_v3`) — the old API was removed in TRT 10 |
+| FP16 selection | `BuilderFlag.FP16` | **strongly-typed network + FP16 ONNX** — the FP16 builder flag is gone in TRT 11 |
+| Engine build tool | `trtexec` CLI | **`build_engine.py`** (TRT Python API) — trtexec isn't in the pip wheels |
+| Camera | Basler GigE (pypylon) | **Reolink RTSP** over the LAN; no Basler present |
+| RTSP decode | GStreamer NVDEC (Jetson `nvv4l2decoder`) | OpenCV **FFmpeg** fallback (automatic — those Jetson GStreamer elements don't exist here) |
+
+Setup:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -U pip wheel
+pip install -r requirements-blackwell.txt \
+    --extra-index-url https://download.pytorch.org/whl/cu130
+```
+
+Ballpark performance on the GB10: **~100–110 fps** at 640×640 (yolo11m ~96 fps,
+yolo26m ~110 fps), vs ~12 fps on the Orin NX.
 
 ---
 
@@ -51,6 +87,31 @@ timing.
 Model binaries are **not** committed (large, and each `.engine` is specific to
 this exact TensorRT version + GPU). Rebuild them like this:
 
+### On the GB10 / Blackwell (this branch)
+
+Export the FP16 ONNX and build the engine with `build_engine.py` (the TRT Python
+API; `trtexec` isn't shipped in the pip wheels). Both steps run on the GB10:
+
+```bash
+source .venv/bin/activate
+# FP16 ONNX (half=True needs the GPU). YOLO26 auto-emits its NMS-free (1,300,6)
+# head; YOLO11 emits the classic (1,84,8400) head. trt_yolo.py decodes BOTH.
+python - <<'PY'
+from ultralytics import YOLO
+for m in ("yolo11m", "yolo26m"):
+    YOLO(m + ".pt").export(format="onnx", imgsz=640, opset=17,
+                           simplify=True, dynamic=False, half=True, device=0)
+PY
+python build_engine.py models/yolo11m.onnx models/yolo11m.engine --fp16
+python build_engine.py models/yolo26m.onnx models/yolo26m.engine --fp16
+```
+
+`config.py` auto-detects whichever `*.engine` files exist and offers them in the
+model switcher (default = newest available). `trt_yolo.py` auto-detects the head
+layout per engine, so YOLO11 `(1,84,8400)` and YOLO26 `(1,300,6)` both work.
+
+### On the Jetson Orin NX (`main` branch)
+
 **1. Export ONNX** (on a workstation with Ultralytics — keeps the Jetson
 torch-free):
 
@@ -59,8 +120,7 @@ python3 -m venv /tmp/yolo-export && source /tmp/yolo-export/bin/activate
 pip install -U ultralytics onnx onnxslim
 # end2end=False keeps the traditional (1,84,8400) head that trt_yolo.py decodes.
 yolo export model=yolo26m.pt format=onnx end2end=False imgsz=640 opset=17 simplify=True half=False
-yolo export model=yolo26l.pt format=onnx end2end=False imgsz=640 opset=17 simplify=True half=False
-scp yolo26m.onnx yolo26l.onnx orinnx1:~/projects/liveobject/models/
+scp yolo26m.onnx orinnx1:~/projects/liveobject/models/
 ```
 
 **2. Build the FP16 TensorRT engine** (on the Orin):
@@ -68,16 +128,7 @@ scp yolo26m.onnx yolo26l.onnx orinnx1:~/projects/liveobject/models/
 ```bash
 cd ~/projects/liveobject/models
 /usr/src/tensorrt/bin/trtexec --onnx=yolo26m.onnx --fp16 --saveEngine=yolo26m.engine
-/usr/src/tensorrt/bin/trtexec --onnx=yolo26l.onnx --fp16 --saveEngine=yolo26l.engine
 ```
-
-`config.py` auto-detects whichever `*.engine` files exist and offers them in the
-model switcher (default = newest available).
-
-> **Why YOLO26 with `end2end=False`?** YOLO26's default head is NMS-free and
-> emits `(1, 300, 6)`, which this app does not decode and which is riskier to
-> build on TensorRT 8.5. `end2end=False` produces the traditional one-to-many
-> head (`(1, 84, 8400)`) — a drop-in for the existing decoder, with the same mAP.
 
 ---
 
