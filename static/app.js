@@ -99,12 +99,31 @@ $("camera-source").addEventListener("change", (e) => {
 });
 $("rtsp-stream").addEventListener("change", (e) => postConfig({ rtsp_stream: e.target.value }));
 
-// ---- tracking controls ----
+// ---- tracking + enrollment controls ----
+let enrollMode = false;
+function setEnrollMode(on) {
+  enrollMode = on;
+  $("enroll-btn").classList.toggle("on", on);
+  $("enroll-hint").textContent = "click a cat on the video…";
+  $("enroll-hint").classList.toggle("hidden", !on);
+}
+$("enroll-btn").addEventListener("click", () => setEnrollMode(!enrollMode));
+$("cats-list").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-clear]");
+  if (b) fetch("/enroll", { method: "POST", headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ action: "clear", name: b.dataset.clear }) });
+});
 $("stream").addEventListener("click", (e) => {
   const r = e.currentTarget.getBoundingClientRect();
-  postTrack({ action: "select",
-              x: (e.clientX - r.left) / r.width,
-              y: (e.clientY - r.top) / r.height });
+  const nx = (e.clientX - r.left) / r.width, ny = (e.clientY - r.top) / r.height;
+  if (enrollMode) {
+    const name = (prompt("Name this cat:") || "").trim();
+    if (name) fetch("/enroll", { method: "POST", headers: { "Content-Type": "application/json" },
+                                 body: JSON.stringify({ action: "enroll", name, x: nx, y: ny }) });
+    setEnrollMode(false);
+    return;
+  }
+  postTrack({ action: "select", x: nx, y: ny });
 });
 $("trk-stop").addEventListener("click", () => postTrack({ action: "stop" }));
 $("trk-list").addEventListener("click", (e) => {           // event delegation
@@ -243,7 +262,19 @@ function poll() {
     $("det-count").textContent = s.count;
     renderDetections(s.detections);
 
-    // ---- tracking ----
+    // ---- cats + tracking ----
+    const cats = s.cats || [];
+    $("cats-list").innerHTML = cats.map((n) =>
+      `<li><span class="swatch" style="background:${colorFor(n)}"></span>`
+      + `<span class="nm">${n}</span>`
+      + `<button class="x" data-clear="${n}" title="forget">✕</button></li>`).join("");
+    if (s.enrolling) {
+      $("enroll-hint").textContent = "learning " + s.enrolling + "…";
+      $("enroll-hint").classList.remove("hidden");
+    } else if (!enrollMode) {
+      $("enroll-hint").classList.add("hidden");
+    }
+
     const tracks = s.tracks || [];
     $("trk-list").innerHTML = tracks.length
       ? tracks.map((t) =>

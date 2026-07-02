@@ -321,3 +321,13 @@ input[type=range]::-moz-range-thumb {
 .trk-readout { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-bottom: 8px; }
 .trk-readout .ro:last-child { grid-column: 1 / -1; }
 .trk-toggles .btn.on { color: var(--cyan); border-color: var(--cyan); }
+
+/* ---- cat enrollment ---- */
+.cats-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.btn.ghost.on { color: var(--cyan); border-color: var(--cyan); }
+.enroll-hint { font-size: 11px; color: var(--cyan); letter-spacing: .5px; }
+.cats-list { list-style: none; margin: 0 0 10px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.cats-list li { display: flex; align-items: center; gap: 8px; padding: 5px 9px; background: var(--inset); font-size: 12px; }
+.cats-list .nm { letter-spacing: .5px; }
+.cats-list .x { margin-left: auto; background: none; border: 0; color: var(--ink-dim); cursor: pointer; }
+.cats-list .x:hover { color: var(--red); }

@@ -129,5 +129,18 @@ def zones():
     return jsonify({"error": "unknown action"}), 400
 
 
+@app.route("/enroll", methods=["POST"])
+def enroll():
+    data = request.get_json(force=True, silent=True) or {}
+    action = data.get("action", "enroll")
+    if action == "enroll" and data.get("name") and data.get("x") is not None:
+        return jsonify(worker.enroll_cat(data["name"], data["x"], data["y"]))
+    if action == "rename" and data.get("old") and data.get("new"):
+        return jsonify(worker.rename_cat(data["old"], data["new"]))
+    if action == "clear" and data.get("name"):
+        return jsonify(worker.clear_cat(data["name"]))
+    return jsonify({"error": "bad enroll request"}), 400
+
+
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)
